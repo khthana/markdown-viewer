@@ -1,17 +1,29 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use crate::search;
 use crate::toc::TocEntry;
+
+/// Whether keys are routed to normal pager navigation or captured as
+/// search-query text input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Normal,
+    Search,
+}
 
 /// State needed to decide what a keypress means.
 ///
 /// `pending_g` tracks whether the previous key was an unconsumed `g`,
 /// so a following `g` completes the `gg` "scroll to top" sequence.
 /// `toc_focused` routes Up/Down/Enter to the TOC sidebar instead of the
-/// main pane while it's true.
+/// main pane while it's true. `mode` is checked first, ahead of
+/// `toc_focused`: while typing a search query, keys are text input
+/// regardless of what else has focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AppState {
     pub pending_g: bool,
     pub toc_focused: bool,
+    pub mode: Mode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +40,13 @@ pub enum Action {
     TocUp,
     TocDown,
     TocJump,
+    EnterSearch,
+    SearchInput(char),
+    SearchBackspace,
+    ConfirmSearch,
+    ExitSearch,
+    NextMatch,
+    PrevMatch,
 }
 
 /// Pure decision function: given the current state and a keypress, what
@@ -36,10 +55,27 @@ pub enum Action {
 pub fn handle_key(state: &AppState, key: KeyEvent) -> Action {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
+    // Ctrl-C is a universal escape hatch, even mid-search.
+    if key.code == KeyCode::Char('c') && ctrl {
+        return Action::Quit;
+    }
+
+    // While typing a search query, almost every key is text input rather
+    // than a navigation shortcut — otherwise a query containing "q" would
+    // quit the app instead of being typed.
+    if state.mode == Mode::Search {
+        return match key.code {
+            KeyCode::Enter => Action::ConfirmSearch,
+            KeyCode::Esc => Action::ExitSearch,
+            KeyCode::Backspace => Action::SearchBackspace,
+            KeyCode::Char(c) => Action::SearchInput(c),
+            _ => Action::None,
+        };
+    }
+
     // Tab and quit are global, regardless of TOC focus.
     match key.code {
         KeyCode::Tab => return Action::ToggleToc,
-        KeyCode::Char('c') if ctrl => return Action::Quit,
         KeyCode::Char('q') => return Action::Quit,
         _ => {}
     }
@@ -65,6 +101,9 @@ pub fn handle_key(state: &AppState, key: KeyEvent) -> Action {
         KeyCode::Char('g') if state.pending_g => Action::Top,
         KeyCode::Char('g') => Action::None,
         KeyCode::Home => Action::Top,
+        KeyCode::Char('/') => Action::EnterSearch,
+        KeyCode::Char('n') => Action::NextMatch,
+        KeyCode::Char('N') => Action::PrevMatch,
         _ => Action::None,
     }
 }
@@ -84,6 +123,13 @@ pub struct App {
     pub toc_open: bool,
     pub toc_focused: bool,
     pub toc_selected: usize,
+    pub mode: Mode,
+    pub search_query: String,
+    /// Whether `Enter` has confirmed a search (as opposed to a query still
+    /// being typed, or no search having been started). Drives whether the
+    /// UI shows highlights/a match-count vs. nothing.
+    pub search_active: bool,
+    pub current_match: Option<usize>,
     pending_g: bool,
 }
 
@@ -96,6 +142,10 @@ impl App {
             toc_open: false,
             toc_focused: false,
             toc_selected: 0,
+            mode: Mode::Normal,
+            search_query: String::new(),
+            search_active: false,
+            current_match: None,
             pending_g: false,
         }
     }
@@ -106,12 +156,14 @@ impl App {
 
     /// Handles a keypress: decides the action, applies it, and updates the
     /// `gg`-sequence flag. `toc` is the currently resolved TOC entries (for
-    /// selection bounds and jump targets). Returns `true` if the app
-    /// should quit.
-    pub fn on_key(&mut self, key: KeyEvent, toc: &[TocEntry]) -> bool {
+    /// selection bounds and jump targets); `matches` is the current
+    /// search's resolved match list (for jump targets and next/prev
+    /// navigation). Returns `true` if the app should quit.
+    pub fn on_key(&mut self, key: KeyEvent, toc: &[TocEntry], matches: &[search::Match]) -> bool {
         let state = AppState {
             pending_g: self.pending_g,
             toc_focused: self.toc_focused,
+            mode: self.mode,
         };
         let action = handle_key(&state, key);
         self.pending_g = matches!(key.code, KeyCode::Char('g')) && !self.pending_g;
@@ -155,6 +207,41 @@ impl App {
                 }
                 self.toc_focused = false;
             }
+            Action::EnterSearch => self.mode = Mode::Search,
+            Action::SearchInput(c) => self.search_query.push(c),
+            Action::SearchBackspace => {
+                self.search_query.pop();
+            }
+            Action::ConfirmSearch => {
+                self.mode = Mode::Normal;
+                self.search_active = true;
+                self.current_match = matches.first().map(|_| 0);
+                if let Some(first) = matches.first() {
+                    self.scroll = first.row.min(self.max_scroll());
+                }
+            }
+            Action::ExitSearch => {
+                self.mode = Mode::Normal;
+                self.search_query.clear();
+                self.search_active = false;
+                self.current_match = None;
+            }
+            Action::NextMatch => {
+                if !matches.is_empty() {
+                    self.current_match = search::next_match(self.current_match, matches.len());
+                    if let Some(idx) = self.current_match {
+                        self.scroll = matches[idx].row.min(self.max_scroll());
+                    }
+                }
+            }
+            Action::PrevMatch => {
+                if !matches.is_empty() {
+                    self.current_match = search::prev_match(self.current_match, matches.len());
+                    if let Some(idx) = self.current_match {
+                        self.scroll = matches[idx].row.min(self.max_scroll());
+                    }
+                }
+            }
             Action::None => {}
         }
         false
@@ -177,6 +264,7 @@ mod tests {
         AppState {
             pending_g,
             toc_focused: false,
+            mode: Mode::Normal,
         }
     }
 
@@ -290,8 +378,79 @@ mod tests {
         let focused = AppState {
             pending_g: false,
             toc_focused: true,
+            mode: Mode::Normal,
         };
         assert_eq!(handle_key(&focused, key(KeyCode::Tab)), Action::ToggleToc);
+    }
+
+    #[test]
+    fn slash_enters_search_mode() {
+        assert_eq!(
+            handle_key(&state(false), key(KeyCode::Char('/'))),
+            Action::EnterSearch
+        );
+    }
+
+    fn search_state() -> AppState {
+        AppState {
+            pending_g: false,
+            toc_focused: false,
+            mode: Mode::Search,
+        }
+    }
+
+    #[test]
+    fn typed_chars_while_searching_build_the_query_even_reserved_keys() {
+        assert_eq!(
+            handle_key(&search_state(), key(KeyCode::Char('a'))),
+            Action::SearchInput('a')
+        );
+        // 'q' is a valid search character, not the global quit shortcut,
+        // while a query is being typed.
+        assert_eq!(
+            handle_key(&search_state(), key(KeyCode::Char('q'))),
+            Action::SearchInput('q')
+        );
+    }
+
+    #[test]
+    fn ctrl_c_still_quits_while_searching() {
+        assert_eq!(
+            handle_key(&search_state(), ctrl_key(KeyCode::Char('c'))),
+            Action::Quit
+        );
+    }
+
+    #[test]
+    fn backspace_while_searching_removes_the_last_typed_character() {
+        assert_eq!(
+            handle_key(&search_state(), key(KeyCode::Backspace)),
+            Action::SearchBackspace
+        );
+    }
+
+    #[test]
+    fn enter_confirms_search_and_esc_exits_it() {
+        assert_eq!(
+            handle_key(&search_state(), key(KeyCode::Enter)),
+            Action::ConfirmSearch
+        );
+        assert_eq!(
+            handle_key(&search_state(), key(KeyCode::Esc)),
+            Action::ExitSearch
+        );
+    }
+
+    #[test]
+    fn n_and_shift_n_navigate_matches_in_normal_mode() {
+        assert_eq!(
+            handle_key(&state(false), key(KeyCode::Char('n'))),
+            Action::NextMatch
+        );
+        assert_eq!(
+            handle_key(&state(false), key(KeyCode::Char('N'))),
+            Action::PrevMatch
+        );
     }
 
     #[test]
@@ -299,6 +458,7 @@ mod tests {
         let focused = AppState {
             pending_g: false,
             toc_focused: true,
+            mode: Mode::Normal,
         };
         assert_eq!(handle_key(&focused, key(KeyCode::Up)), Action::TocUp);
         assert_eq!(handle_key(&focused, key(KeyCode::Down)), Action::TocDown);
@@ -318,10 +478,10 @@ mod tests {
         app.viewport_height = 10;
         app.scroll = 50;
 
-        assert!(!app.on_key(key(KeyCode::Char('g')), &[]));
+        assert!(!app.on_key(key(KeyCode::Char('g')), &[], &[]));
         assert_eq!(app.scroll, 50, "first g should not move the scroll yet");
 
-        assert!(!app.on_key(key(KeyCode::Char('g')), &[]));
+        assert!(!app.on_key(key(KeyCode::Char('g')), &[], &[]));
         assert_eq!(app.scroll, 0, "second g completes gg and scrolls to top");
     }
 
@@ -330,13 +490,13 @@ mod tests {
         let mut app = App::new(10);
         app.viewport_height = 5;
 
-        app.on_key(key(KeyCode::Char('k')), &[]);
+        app.on_key(key(KeyCode::Char('k')), &[], &[]);
         assert_eq!(app.scroll, 0, "scrolling up from the top stays at 0");
 
-        app.on_key(key(KeyCode::Char('G')), &[]);
+        app.on_key(key(KeyCode::Char('G')), &[], &[]);
         assert_eq!(app.scroll, app.max_scroll(), "G scrolls to the max offset");
 
-        app.on_key(key(KeyCode::Char('j')), &[]);
+        app.on_key(key(KeyCode::Char('j')), &[], &[]);
         assert_eq!(
             app.scroll,
             app.max_scroll(),
@@ -347,7 +507,7 @@ mod tests {
     #[test]
     fn app_quit_returns_true() {
         let mut app = App::new(1);
-        assert!(app.on_key(key(KeyCode::Char('q')), &[]));
+        assert!(app.on_key(key(KeyCode::Char('q')), &[], &[]));
     }
 
     #[test]
@@ -355,11 +515,11 @@ mod tests {
         let mut app = App::new(100);
         let toc = vec![toc_entry("A", 0), toc_entry("B", 10)];
 
-        app.on_key(key(KeyCode::Tab), &toc);
+        app.on_key(key(KeyCode::Tab), &toc, &[]);
         assert!(app.toc_open);
         assert!(app.toc_focused);
 
-        app.on_key(key(KeyCode::Tab), &toc);
+        app.on_key(key(KeyCode::Tab), &toc, &[]);
         assert!(!app.toc_open, "Tab from focused state closes the sidebar");
         assert!(!app.toc_focused);
     }
@@ -368,17 +528,17 @@ mod tests {
     fn toc_selection_moves_with_up_down_and_clamps() {
         let mut app = App::new(100);
         let toc = vec![toc_entry("A", 0), toc_entry("B", 5), toc_entry("C", 10)];
-        app.on_key(key(KeyCode::Tab), &toc); // open + focus
+        app.on_key(key(KeyCode::Tab), &toc, &[]); // open + focus
 
-        app.on_key(key(KeyCode::Up), &toc);
+        app.on_key(key(KeyCode::Up), &toc, &[]);
         assert_eq!(
             app.toc_selected, 0,
             "selection can't go above the first entry"
         );
 
-        app.on_key(key(KeyCode::Down), &toc);
-        app.on_key(key(KeyCode::Down), &toc);
-        app.on_key(key(KeyCode::Down), &toc);
+        app.on_key(key(KeyCode::Down), &toc, &[]);
+        app.on_key(key(KeyCode::Down), &toc, &[]);
+        app.on_key(key(KeyCode::Down), &toc, &[]);
         assert_eq!(
             app.toc_selected, 2,
             "selection clamps at the last entry, not past it"
@@ -390,10 +550,10 @@ mod tests {
         let mut app = App::new(100);
         app.viewport_height = 10;
         let toc = vec![toc_entry("A", 0), toc_entry("B", 5)];
-        app.on_key(key(KeyCode::Tab), &toc); // open + focus
-        app.on_key(key(KeyCode::Down), &toc); // select "B"
+        app.on_key(key(KeyCode::Tab), &toc, &[]); // open + focus
+        app.on_key(key(KeyCode::Down), &toc, &[]); // select "B"
 
-        app.on_key(key(KeyCode::Enter), &toc);
+        app.on_key(key(KeyCode::Enter), &toc, &[]);
 
         assert_eq!(app.scroll, 5, "jumped to the selected heading's row");
         assert!(app.toc_open, "sidebar stays open after a jump");
@@ -407,9 +567,9 @@ mod tests {
         let mut app = App::new(20);
         app.viewport_height = 10;
         let toc = vec![toc_entry("Near the end", 18)];
-        app.on_key(key(KeyCode::Tab), &toc);
+        app.on_key(key(KeyCode::Tab), &toc, &[]);
 
-        app.on_key(key(KeyCode::Enter), &toc);
+        app.on_key(key(KeyCode::Enter), &toc, &[]);
 
         assert_eq!(app.scroll, 10, "jump target clamps to max_scroll");
     }
@@ -420,12 +580,100 @@ mod tests {
         let mut app = App::new(100);
         app.viewport_height = 10;
         let toc = vec![toc_entry("A", 0), toc_entry("B", 5)];
-        app.on_key(key(KeyCode::Tab), &toc); // open + focus
-        app.on_key(key(KeyCode::Enter), &toc); // jump: open, unfocused
+        app.on_key(key(KeyCode::Tab), &toc, &[]); // open + focus
+        app.on_key(key(KeyCode::Enter), &toc, &[]); // jump: open, unfocused
 
-        app.on_key(key(KeyCode::Tab), &toc);
+        app.on_key(key(KeyCode::Tab), &toc, &[]);
 
         assert!(app.toc_open, "still open");
         assert!(app.toc_focused, "Tab re-focused it instead of closing it");
+    }
+
+    fn a_match(row: usize, start: usize, end: usize) -> search::Match {
+        search::Match { row, start, end }
+    }
+
+    #[test]
+    fn confirming_a_search_jumps_to_the_first_match_and_activates_it() {
+        let mut app = App::new(100);
+        app.viewport_height = 10;
+        app.mode = Mode::Search;
+        app.search_query = "fox".to_string();
+        let matches = vec![a_match(20, 0, 3), a_match(40, 0, 3)];
+
+        app.on_key(key(KeyCode::Enter), &[], &matches);
+
+        assert_eq!(app.mode, Mode::Normal, "confirming returns to normal mode");
+        assert!(app.search_active);
+        assert_eq!(app.current_match, Some(0));
+        assert_eq!(app.scroll, 20, "jumped to the first match's row");
+    }
+
+    #[test]
+    fn confirming_a_search_with_no_matches_leaves_scroll_untouched() {
+        let mut app = App::new(100);
+        app.viewport_height = 10;
+        app.mode = Mode::Search;
+        app.search_query = "elephant".to_string();
+        app.scroll = 5;
+
+        app.on_key(key(KeyCode::Enter), &[], &[]);
+
+        assert!(
+            app.search_active,
+            "a confirmed search with zero results is still active"
+        );
+        assert_eq!(app.current_match, None);
+        assert_eq!(app.scroll, 5, "no match to jump to, so scroll is unchanged");
+    }
+
+    #[test]
+    fn n_advances_to_the_next_match_and_wraps_to_the_first() {
+        let mut app = App::new(100);
+        app.viewport_height = 10;
+        app.search_active = true;
+        app.current_match = Some(0);
+        let matches = vec![a_match(10, 0, 3), a_match(30, 0, 3), a_match(50, 0, 3)];
+
+        app.on_key(key(KeyCode::Char('n')), &[], &matches);
+        assert_eq!(app.current_match, Some(1));
+        assert_eq!(app.scroll, 30);
+
+        app.on_key(key(KeyCode::Char('n')), &[], &matches);
+        assert_eq!(app.current_match, Some(2));
+        assert_eq!(app.scroll, 50);
+
+        app.on_key(key(KeyCode::Char('n')), &[], &matches);
+        assert_eq!(app.current_match, Some(0), "wraps back to the first match");
+        assert_eq!(app.scroll, 10);
+    }
+
+    #[test]
+    fn shift_n_retreats_to_the_previous_match_and_wraps_to_the_last() {
+        let mut app = App::new(100);
+        app.viewport_height = 10;
+        app.search_active = true;
+        app.current_match = Some(0);
+        let matches = vec![a_match(10, 0, 3), a_match(30, 0, 3), a_match(50, 0, 3)];
+
+        app.on_key(key(KeyCode::Char('N')), &[], &matches);
+        assert_eq!(app.current_match, Some(2), "wraps back to the last match");
+        assert_eq!(app.scroll, 50);
+    }
+
+    #[test]
+    fn esc_clears_the_query_and_deactivates_the_search() {
+        let mut app = App::new(100);
+        app.mode = Mode::Search;
+        app.search_query = "fox".to_string();
+        app.search_active = true;
+        app.current_match = Some(0);
+
+        app.on_key(key(KeyCode::Esc), &[], &[a_match(0, 0, 3)]);
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.search_query, "");
+        assert!(!app.search_active);
+        assert_eq!(app.current_match, None);
     }
 }

@@ -41,6 +41,22 @@ pub fn heading_style(level: u8) -> HeadingStyle {
     }
 }
 
+/// Style for a search match that isn't the currently-selected one.
+pub fn search_match_style() -> Style {
+    Style::new().bg(Color::Yellow).fg(Color::Black)
+}
+
+/// Style for the currently-selected search match — a brighter background
+/// than [`search_match_style`] so `n`/`N` navigation is visible at a
+/// glance, following the same "lighter shade distinguishes" idiom as the
+/// H1/H2 heading rules above.
+pub fn search_current_match_style() -> Style {
+    Style::new()
+        .bg(Color::LightYellow)
+        .fg(Color::Black)
+        .add_modifier(Modifier::BOLD)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,6 +98,25 @@ mod tests {
         }
         assert!(h4.indent < h5.indent);
         assert!(h5.indent < h6.indent);
+    }
+
+    #[test]
+    fn search_match_and_current_match_styles_are_visually_distinct() {
+        assert_ne!(search_match_style(), search_current_match_style());
+    }
+
+    #[test]
+    fn search_highlight_styles_stay_within_the_16_color_palette() {
+        for style in [search_match_style(), search_current_match_style()] {
+            for color in [style.fg, style.bg] {
+                match color {
+                    Some(Color::Rgb(..)) | Some(Color::Indexed(_)) => {
+                        panic!("search highlight uses a non-16-color Color variant")
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     #[test]

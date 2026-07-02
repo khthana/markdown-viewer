@@ -3,6 +3,7 @@ mod cli;
 mod event;
 mod highlight;
 mod markdown;
+mod search;
 mod theme;
 mod toc;
 mod ui;
@@ -41,17 +42,19 @@ fn run(
         let size = terminal.size()?;
         let area = Rect::new(0, 0, size.width, size.height);
         let (_, main_area) = ui::split_areas(area, app.toc_open);
+        let (content_area, _) = ui::split_status(main_area, ui::search_status_visible(&app));
 
-        app.viewport_height = main_area.height as usize;
+        app.viewport_height = content_area.height as usize;
         let layout_doc = layout::layout(&blocks, main_area.width as usize);
         app.total_rows = layout_doc.total_rows;
         let toc_entries = toc::resolve(&headings, &layout_doc);
+        let matches = search::search(&app.search_query, &layout_doc);
 
-        terminal.draw(|frame| ui::render(frame, &app, &blocks, &toc_entries))?;
+        terminal.draw(|frame| ui::render(frame, &app, &blocks, &toc_entries, &matches))?;
 
         match rx.recv() {
             Ok(Event::Key(key)) => {
-                if app.on_key(key, &toc_entries) {
+                if app.on_key(key, &toc_entries, &matches) {
                     return Ok(());
                 }
             }

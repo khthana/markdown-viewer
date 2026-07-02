@@ -16,6 +16,10 @@ pub struct LaidOutBlock {
 pub struct LayoutDoc {
     pub blocks: Vec<LaidOutBlock>,
     pub total_rows: usize,
+    /// Each row's plain text (styling stripped), index-aligned with the
+    /// row-number space `blocks`/`total_rows` use. Exists for `search` to
+    /// match against, without a second render pass.
+    pub rows: Vec<String>,
 }
 
 /// Computes virtual row ranges for each top-level block at the given
@@ -28,12 +32,14 @@ pub struct LayoutDoc {
 /// scrolling).
 pub fn layout(blocks: &[Block], width: usize) -> LayoutDoc {
     let mut laid_out = Vec::with_capacity(blocks.len());
+    let mut rows = Vec::new();
     let mut row_start = 0;
 
     for (block_index, block) in blocks.iter().enumerate() {
         let mut scratch = Vec::new();
         render_block(block, width, &mut scratch);
         let row_count = scratch.len();
+        rows.extend(scratch.iter().map(line_plain_text));
         laid_out.push(LaidOutBlock {
             block_index,
             row_start,
@@ -45,7 +51,13 @@ pub fn layout(blocks: &[Block], width: usize) -> LayoutDoc {
     LayoutDoc {
         blocks: laid_out,
         total_rows: row_start,
+        rows,
     }
+}
+
+/// Concatenates a line's spans down to their plain text, discarding style.
+fn line_plain_text(line: &Line<'static>) -> String {
+    line.spans.iter().map(|s| s.content.as_ref()).collect()
 }
 
 /// Renders the full document into styled, wrapped terminal lines at the
@@ -420,6 +432,13 @@ mod tests {
         }];
         // item "one": 1 row; item "two": 1 row + 1 nested-list row = 2 rows.
         assert_eq!(layout(&blocks, 80).blocks[0].row_count, 3);
+    }
+
+    #[test]
+    fn layout_rows_expose_each_rendered_rows_plain_text_for_search() {
+        let blocks = vec![text_paragraph("hello world")];
+        let doc = layout(&blocks, 80);
+        assert_eq!(doc.rows, vec!["hello world".to_string()]);
     }
 
     #[test]

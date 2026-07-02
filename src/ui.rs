@@ -1,12 +1,14 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
-use ratatui::text::Text;
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block as RatBlock, Borders, List, ListItem, Paragraph};
 
-use crate::app::App;
+use crate::app::{App, Mode};
 use crate::markdown::blocks::Block;
 use crate::markdown::layout;
+use crate::search;
+use crate::theme;
 use crate::toc::TocEntry;
 
 /// Splits a frame's area into an optional TOC sidebar and the main
@@ -29,6 +31,71 @@ pub fn split_areas(area: Rect, toc_open: bool) -> (Option<Rect>, Rect) {
 
 const TOC_WIDTH: u16 = 28;
 
+/// Splits a pane's area into the content area and, when `show`, a
+/// reserved bottom row for the search status line (live query while
+/// typing, or a "no matches" indicator after confirming). Called by both
+/// `main.rs` (for `App::viewport_height`) and `render`, on the same area,
+/// for the same reason `split_areas` is shared: the two must never
+/// compute different heights for the same frame.
+pub fn split_status(area: Rect, show: bool) -> (Rect, Option<Rect>) {
+    if !show {
+        return (area, None);
+    }
+    let chunks = ratatui::layout::Layout::default()
+        .direction(ratatui::layout::Direction::Vertical)
+        .constraints([
+            ratatui::layout::Constraint::Min(0),
+            ratatui::layout::Constraint::Length(1),
+        ])
+        .split(area);
+    (chunks[0], Some(chunks[1]))
+}
+
+/// Patches `style` onto the half-open char range `[start, end)` of
+/// `line`, splitting spans at the range's boundaries so the rest of the
+/// line keeps its existing style. `start`/`end` are char offsets into the
+/// line's full plain text, matching `search::Match`'s row-relative
+/// offsets.
+fn highlight_line(line: Line<'static>, start: usize, end: usize, style: Style) -> Line<'static> {
+    if start >= end {
+        return line;
+    }
+
+    let mut spans = Vec::with_capacity(line.spans.len());
+    let mut col = 0usize;
+
+    for span in line.spans {
+        let chars: Vec<char> = span.content.chars().collect();
+        let span_start = col;
+        let span_end = col + chars.len();
+        col = span_end;
+
+        if end <= span_start || start >= span_end {
+            spans.push(span);
+            continue;
+        }
+
+        let local_start = start.saturating_sub(span_start);
+        let local_end = end.min(span_end) - span_start;
+
+        let before: String = chars[..local_start].iter().collect();
+        let matched: String = chars[local_start..local_end].iter().collect();
+        let after: String = chars[local_end..].iter().collect();
+
+        if !before.is_empty() {
+            spans.push(Span::styled(before, span.style));
+        }
+        if !matched.is_empty() {
+            spans.push(Span::styled(matched, span.style.patch(style)));
+        }
+        if !after.is_empty() {
+            spans.push(Span::styled(after, span.style));
+        }
+    }
+
+    Line::from(spans)
+}
+
 /// Renders the document in a scrollable pane, plus the TOC sidebar when
 /// open.
 ///
@@ -37,17 +104,62 @@ const TOC_WIDTH: u16 = 28;
 /// `App`'s scroll math thinks is there. `toc` must have been resolved
 /// against a `LayoutDoc` built at this same main-pane width — callers
 /// should use `split_areas` on the same `area` for that layout pass too.
-pub fn render(frame: &mut Frame, app: &App, blocks: &[Block], toc: &[TocEntry]) {
+/// `matches` is only painted onto the text when `app.search_active`, and
+/// must have been resolved against that same `LayoutDoc`.
+pub fn render(
+    frame: &mut Frame,
+    app: &App,
+    blocks: &[Block],
+    toc: &[TocEntry],
+    matches: &[search::Match],
+) {
     let area = frame.area();
     let (sidebar_area, main_area) = split_areas(area, app.toc_open);
+    let (content_area, status_area) = split_status(main_area, search_status_visible(app));
 
-    let lines = layout::render_lines(blocks, main_area.width as usize);
+    let mut lines = layout::render_lines(blocks, main_area.width as usize);
+    if app.search_active {
+        for (i, m) in matches.iter().enumerate() {
+            if let Some(line) = lines.get_mut(m.row) {
+                let style = if Some(i) == app.current_match {
+                    theme::search_current_match_style()
+                } else {
+                    theme::search_match_style()
+                };
+                *line = highlight_line(std::mem::take(line), m.start, m.end, style);
+            }
+        }
+    }
     let paragraph = Paragraph::new(Text::from(lines)).scroll((app.scroll as u16, 0));
-    frame.render_widget(paragraph, main_area);
+    frame.render_widget(paragraph, content_area);
+
+    if let Some(status_area) = status_area {
+        render_status(frame, status_area, app, matches);
+    }
 
     if let Some(sidebar_area) = sidebar_area {
         render_toc(frame, sidebar_area, toc, app.toc_selected, app.toc_focused);
     }
+}
+
+/// Whether the bottom status row should be reserved: while typing a
+/// query, or while a confirmed search is active (to show either its
+/// highlighted-match state or a "no matches" indicator). Shared between
+/// `render` and `main.rs`'s `App::viewport_height` bookkeeping so both
+/// agree on how tall the content pane actually is.
+pub fn search_status_visible(app: &App) -> bool {
+    app.mode == Mode::Search || app.search_active
+}
+
+fn render_status(frame: &mut Frame, area: Rect, app: &App, matches: &[search::Match]) {
+    let text = if app.mode == Mode::Search {
+        format!("/{}", app.search_query)
+    } else if app.search_active && matches.is_empty() {
+        format!("No matches for \"{}\"", app.search_query)
+    } else {
+        String::new()
+    };
+    frame.render_widget(Paragraph::new(text), area);
 }
 
 fn render_toc(frame: &mut Frame, area: Rect, toc: &[TocEntry], selected: usize, focused: bool) {
@@ -85,6 +197,163 @@ mod tests {
 
     use super::*;
     use crate::markdown::blocks::Inline;
+
+    #[test]
+    fn split_status_returns_full_area_when_not_shown() {
+        let area = Rect::new(0, 0, 80, 24);
+        let (content, status) = split_status(area, false);
+        assert_eq!(status, None);
+        assert_eq!(content, area);
+    }
+
+    #[test]
+    fn split_status_reserves_the_bottom_row_when_shown() {
+        let area = Rect::new(0, 0, 80, 24);
+        let (content, status) = split_status(area, true);
+        let status = status.expect("status row should be present when shown");
+
+        assert_eq!(
+            content.height,
+            area.height - 1,
+            "content pane loses one row"
+        );
+        assert_eq!(status.height, 1);
+        assert_eq!(
+            status.y,
+            content.y + content.height,
+            "status sits below content"
+        );
+        assert_eq!(status.width, area.width);
+    }
+
+    #[test]
+    fn typing_a_search_query_shows_it_on_the_status_line() {
+        let blocks = crate::markdown::blocks::lower("hello world");
+        let mut app = App::new(0);
+        app.mode = Mode::Search;
+        app.search_query = "wor".to_string();
+
+        let backend = TestBackend::new(20, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, &app, &blocks, &[], &[]))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let status_row: String = (0..20)
+            .map(|x| buffer.cell((x, 2)).unwrap().symbol().to_string())
+            .collect();
+        assert!(status_row.starts_with("/wor"), "got: {status_row:?}");
+    }
+
+    #[test]
+    fn confirmed_search_with_no_matches_shows_a_no_matches_indicator() {
+        let blocks = crate::markdown::blocks::lower("hello world");
+        let mut app = App::new(0);
+        app.search_active = true;
+        app.search_query = "xyz".to_string();
+
+        let backend = TestBackend::new(20, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, &app, &blocks, &[], &[]))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let status_row: String = (0..20)
+            .map(|x| buffer.cell((x, 2)).unwrap().symbol().to_string())
+            .collect();
+        assert!(status_row.contains("No matches"), "got: {status_row:?}");
+    }
+
+    #[test]
+    fn highlight_line_patches_style_onto_the_matched_range_and_preserves_the_rest() {
+        let line = Line::from(Span::raw("the quick brown fox"));
+
+        let highlighted = highlight_line(line, 4, 9, crate::theme::search_match_style());
+
+        let plain: String = highlighted
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(
+            plain, "the quick brown fox",
+            "content is unchanged, only style differs"
+        );
+        let matched = highlighted
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "quick")
+            .expect("the matched substring should be its own span");
+        assert_eq!(matched.style, crate::theme::search_match_style());
+    }
+
+    #[test]
+    fn highlight_line_splits_a_match_that_crosses_a_span_boundary() {
+        // "bold" is its own styled span; " text" is a separate plain
+        // span. The match "ld te" (chars 2..7) straddles both.
+        let bold_style = Style::new().add_modifier(Modifier::BOLD);
+        let line = Line::from(vec![Span::styled("bold", bold_style), Span::raw(" text")]);
+
+        let highlighted = highlight_line(line, 2, 7, crate::theme::search_match_style());
+
+        let plain: String = highlighted
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(plain, "bold text");
+
+        let highlight_style = crate::theme::search_match_style();
+        let highlighted_text: String = highlighted
+            .spans
+            .iter()
+            .filter(|s| s.style == bold_style.patch(highlight_style) || s.style == highlight_style)
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(
+            highlighted_text, "ld te",
+            "the matched substring spanning both original spans is fully highlighted"
+        );
+    }
+
+    #[test]
+    fn confirmed_search_highlights_the_current_match_distinctly_from_other_matches() {
+        let source = "fox fox fox";
+        let blocks = crate::markdown::blocks::lower(source);
+        let layout_doc = layout::layout(&blocks, 80);
+        let matches = crate::search::search("fox", &layout_doc);
+        assert_eq!(matches.len(), 3);
+
+        let mut app = App::new(layout_doc.total_rows);
+        app.search_active = true;
+        app.current_match = Some(1); // the middle "fox"
+
+        let backend = TestBackend::new(20, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, &app, &blocks, &[], &matches))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        // "fox fox fox": matches at cols 0-2, 4-6, 8-10.
+        assert_eq!(
+            buffer.cell((0, 0)).unwrap().style().bg,
+            Some(Color::Yellow),
+            "first match uses the ordinary match style"
+        );
+        assert_eq!(
+            buffer.cell((4, 0)).unwrap().style().bg,
+            Some(Color::LightYellow),
+            "the selected match (index 1) is visually distinct"
+        );
+        assert_eq!(
+            buffer.cell((8, 0)).unwrap().style().bg,
+            Some(Color::Yellow),
+            "third match uses the ordinary match style"
+        );
+    }
 
     #[test]
     fn split_areas_returns_full_area_when_toc_closed() {
@@ -138,7 +407,7 @@ mod tests {
         let backend = TestBackend::new(area.width, area.height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render(frame, &app, &blocks, &toc))
+            .draw(|frame| render(frame, &app, &blocks, &toc, &[]))
             .unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -171,7 +440,7 @@ mod tests {
         let backend = TestBackend::new(area.width, area.height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render(frame, &app, &blocks, &toc))
+            .draw(|frame| render(frame, &app, &blocks, &toc, &[]))
             .unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -224,7 +493,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let app = App::new(0);
         terminal
-            .draw(|frame| render(frame, &app, &blocks, &[]))
+            .draw(|frame| render(frame, &app, &blocks, &[], &[]))
             .unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -324,7 +593,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let app = App::new(0);
         terminal
-            .draw(|frame| render(frame, &app, &blocks, &[]))
+            .draw(|frame| render(frame, &app, &blocks, &[], &[]))
             .unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -347,7 +616,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let app = App::new(0);
         terminal
-            .draw(|frame| render(frame, &app, blocks, &[]))
+            .draw(|frame| render(frame, &app, blocks, &[], &[]))
             .unwrap();
         let buffer = terminal.backend().buffer();
         (0..height)
