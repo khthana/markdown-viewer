@@ -52,14 +52,39 @@ pub enum Block {
     },
 }
 
-/// Lowers CommonMark `source` into an owned `Vec<Block>`.
+/// A heading collected during the lowering pass, for TOC construction.
+/// `block_index` refers to the top-level `Vec<Block>` `lower_with_headings`
+/// returns, so it lines up with `layout::LaidOutBlock::block_index`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadingRef {
+    pub level: u8,
+    pub text: String,
+    pub block_index: usize,
+}
+
+/// Lowers CommonMark `source` into an owned `Vec<Block>`, discarding the
+/// heading list. Production code always needs both (for the TOC), so
+/// this convenience wrapper only exists for tests that don't.
+#[cfg(test)]
+pub(crate) fn lower(source: &str) -> Vec<Block> {
+    lower_with_headings(source).0
+}
+
+/// Same as [`lower`], but also collects every top-level heading in
+/// document order — in the same pass, so building a TOC doesn't require
+/// a second walk of the document.
+///
+/// Headings nested inside a blockquote or list item are skipped: their
+/// `block_index` wouldn't refer to a top-level block, and headings that
+/// deep are rare enough that a v1 TOC can reasonably omit them.
 ///
 /// Inline content (text, bold, italic, ...) can nest, so open spans are
 /// tracked as a stack of buffers: starting a span pushes a fresh buffer,
 /// ending one pops it and appends the finished span to its parent. Block
 /// containers (blockquotes, list items) nest the same way one level up,
 /// via a stack of block buffers.
-pub fn lower(source: &str) -> Vec<Block> {
+pub fn lower_with_headings(source: &str) -> (Vec<Block>, Vec<HeadingRef>) {
+    let mut headings = Vec::new();
     let mut blocks = Vec::new();
     let mut containers: Vec<Vec<Block>> = Vec::new();
     let mut stack: Vec<Vec<Inline>> = Vec::new();
@@ -186,6 +211,13 @@ pub fn lower(source: &str) -> Vec<Block> {
             }
             CmEvent::End(TagEnd::Heading(level)) => {
                 let text = stack.pop().unwrap_or_default();
+                if containers.is_empty() {
+                    headings.push(HeadingRef {
+                        level: level as u8,
+                        text: flatten_plain_text(&text),
+                        block_index: blocks.len(),
+                    });
+                }
                 push_block(
                     &mut blocks,
                     &mut containers,
@@ -239,7 +271,24 @@ pub fn lower(source: &str) -> Vec<Block> {
         }
     }
 
-    blocks
+    (blocks, headings)
+}
+
+/// Flattens inline spans down to their plain text content, e.g. for TOC
+/// entry labels where inline styling doesn't apply.
+pub fn flatten_plain_text(inlines: &[Inline]) -> String {
+    let mut out = String::new();
+    for inline in inlines {
+        match inline {
+            Inline::Text(text) => out.push_str(text),
+            Inline::Bold(inner)
+            | Inline::Italic(inner)
+            | Inline::Strikethrough(inner)
+            | Inline::Link { text: inner, .. } => out.push_str(&flatten_plain_text(inner)),
+            Inline::FootnoteReference(label) => out.push_str(&format!("[^{label}]")),
+        }
+    }
+    out
 }
 
 fn column_alignment(alignment: Alignment) -> ColumnAlignment {
@@ -524,5 +573,34 @@ mod tests {
                 ],
             }]
         );
+    }
+
+    #[test]
+    fn lower_with_headings_collects_headings_in_document_order_with_block_index() {
+        let source = "# Title\n\nIntro text.\n\n## Section\n\nMore text.\n\n### Sub";
+        let (blocks, headings) = lower_with_headings(source);
+
+        assert_eq!(
+            headings,
+            vec![
+                HeadingRef {
+                    level: 1,
+                    text: "Title".to_string(),
+                    block_index: 0,
+                },
+                HeadingRef {
+                    level: 2,
+                    text: "Section".to_string(),
+                    block_index: 2,
+                },
+                HeadingRef {
+                    level: 3,
+                    text: "Sub".to_string(),
+                    block_index: 4,
+                },
+            ]
+        );
+        // The wrapper `lower()` returns the same blocks lower_with_headings does.
+        assert_eq!(blocks, lower(source));
     }
 }

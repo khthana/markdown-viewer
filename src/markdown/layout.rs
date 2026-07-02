@@ -1,7 +1,7 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::markdown::blocks::{Block, ColumnAlignment, Inline};
+use crate::markdown::blocks::{Block, ColumnAlignment, Inline, flatten_plain_text};
 use crate::theme;
 
 /// One block's assigned position in the document's virtual row space.
@@ -157,10 +157,10 @@ fn render_table(
     out: &mut Vec<Line<'static>>,
 ) {
     let column_count = header.len();
-    let header_text: Vec<String> = header.iter().map(|c| flatten_plain(c)).collect();
+    let header_text: Vec<String> = header.iter().map(|c| flatten_plain_text(c)).collect();
     let row_texts: Vec<Vec<String>> = rows
         .iter()
-        .map(|r| r.iter().map(|c| flatten_plain(c)).collect())
+        .map(|r| r.iter().map(|c| flatten_plain_text(c)).collect())
         .collect();
 
     let mut col_widths = vec![0usize; column_count];
@@ -191,21 +191,6 @@ fn render_table(
             width,
         ));
     }
-}
-
-fn flatten_plain(inlines: &[Inline]) -> String {
-    let mut out = String::new();
-    for inline in inlines {
-        match inline {
-            Inline::Text(text) => out.push_str(text),
-            Inline::Bold(inner)
-            | Inline::Italic(inner)
-            | Inline::Strikethrough(inner)
-            | Inline::Link { text: inner, .. } => out.push_str(&flatten_plain(inner)),
-            Inline::FootnoteReference(label) => out.push_str(&format!("[^{label}]")),
-        }
-    }
-    out
 }
 
 fn pad_cell(text: &str, col_width: usize, alignment: ColumnAlignment) -> String {

@@ -1,21 +1,80 @@
 use ratatui::Frame;
+use ratatui::layout::Rect;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::Text;
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block as RatBlock, Borders, List, ListItem, Paragraph};
 
 use crate::app::App;
 use crate::markdown::blocks::Block;
 use crate::markdown::layout;
+use crate::toc::TocEntry;
 
-/// Renders the document in a scrollable pane.
+/// Splits a frame's area into an optional TOC sidebar and the main
+/// content pane. Used by both `main.rs` (to lay out the document at the
+/// right width) and `render` (to draw at that same width) — a single
+/// seam so the two can't compute different widths for the same frame.
+pub fn split_areas(area: Rect, toc_open: bool) -> (Option<Rect>, Rect) {
+    if !toc_open {
+        return (None, area);
+    }
+    let chunks = ratatui::layout::Layout::default()
+        .direction(ratatui::layout::Direction::Horizontal)
+        .constraints([
+            ratatui::layout::Constraint::Length(TOC_WIDTH),
+            ratatui::layout::Constraint::Min(0),
+        ])
+        .split(area);
+    (Some(chunks[0]), chunks[1])
+}
+
+const TOC_WIDTH: u16 = 28;
+
+/// Renders the document in a scrollable pane, plus the TOC sidebar when
+/// open.
 ///
 /// Uses `layout::render_lines` (the same function `layout::layout` uses
 /// to compute row counts) so what's on screen always matches what
-/// `App`'s scroll math thinks is there.
-pub fn render(frame: &mut Frame, app: &App, blocks: &[Block]) {
+/// `App`'s scroll math thinks is there. `toc` must have been resolved
+/// against a `LayoutDoc` built at this same main-pane width — callers
+/// should use `split_areas` on the same `area` for that layout pass too.
+pub fn render(frame: &mut Frame, app: &App, blocks: &[Block], toc: &[TocEntry]) {
     let area = frame.area();
-    let lines = layout::render_lines(blocks, area.width as usize);
+    let (sidebar_area, main_area) = split_areas(area, app.toc_open);
+
+    let lines = layout::render_lines(blocks, main_area.width as usize);
     let paragraph = Paragraph::new(Text::from(lines)).scroll((app.scroll as u16, 0));
-    frame.render_widget(paragraph, area);
+    frame.render_widget(paragraph, main_area);
+
+    if let Some(sidebar_area) = sidebar_area {
+        render_toc(frame, sidebar_area, toc, app.toc_selected, app.toc_focused);
+    }
+}
+
+fn render_toc(frame: &mut Frame, area: Rect, toc: &[TocEntry], selected: usize, focused: bool) {
+    let items: Vec<ListItem> = toc
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let indent = " ".repeat(entry.level.saturating_sub(1) as usize * 2);
+            let style = if i == selected {
+                Style::new().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            ListItem::new(format!("{indent}{}", entry.text)).style(style)
+        })
+        .collect();
+
+    let border_style = if focused {
+        Style::new().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    let block = RatBlock::new()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title("Outline");
+    frame.render_widget(List::new(items).block(block), area);
 }
 
 #[cfg(test)]
@@ -26,6 +85,123 @@ mod tests {
 
     use super::*;
     use crate::markdown::blocks::Inline;
+
+    #[test]
+    fn split_areas_returns_full_area_when_toc_closed() {
+        let area = Rect::new(0, 0, 80, 24);
+        let (sidebar, main) = split_areas(area, false);
+        assert_eq!(sidebar, None);
+        assert_eq!(main, area);
+    }
+
+    #[test]
+    fn split_areas_narrows_main_pane_when_toc_open() {
+        let area = Rect::new(0, 0, 80, 24);
+        let (sidebar, main) = split_areas(area, true);
+        let sidebar = sidebar.expect("sidebar should be present when open");
+
+        assert_eq!(sidebar.x, 0);
+        assert_eq!(main.x, sidebar.width);
+        assert_eq!(sidebar.width + main.width, area.width);
+        assert_eq!(
+            main.height, area.height,
+            "sidebar is horizontal, full height"
+        );
+    }
+
+    #[test]
+    fn toc_row_resolution_matches_actual_render_width_when_sidebar_is_open() {
+        // Regression test: TOC rows must be resolved against the
+        // *narrowed* main-pane width (post-split), not the full frame
+        // width — otherwise jumping to a heading lands on the wrong row
+        // once the sidebar takes up horizontal space.
+        let area = Rect::new(0, 0, 50, 10);
+        let (_, main_area) = split_areas(area, true);
+
+        let source = "one two three four five six seven eight\n\n# Target";
+        let (blocks, headings) = crate::markdown::blocks::lower_with_headings(source);
+
+        let layout_doc = layout::layout(&blocks, main_area.width as usize);
+        let toc = crate::toc::resolve(&headings, &layout_doc);
+        let target_row = toc[0].row;
+        assert!(
+            target_row > 0,
+            "the paragraph should wrap to more than one row at the narrowed width, \
+             pushing the heading down"
+        );
+
+        let mut app = App::new(layout_doc.total_rows);
+        app.toc_open = true;
+        app.scroll = target_row;
+        app.viewport_height = area.height as usize;
+
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, &app, &blocks, &toc))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let sidebar_width = area.width - main_area.width;
+        let first_char = buffer
+            .cell((sidebar_width, 0))
+            .unwrap()
+            .symbol()
+            .to_string();
+        assert_eq!(
+            first_char, "T",
+            "scrolling to the resolved row should show the heading, not paragraph overflow"
+        );
+    }
+
+    #[test]
+    fn toc_open_snapshot_shows_sidebar_with_indented_entries_and_selection() {
+        let source = "# Title\n\nIntro.\n\n## Section One\n\n### Sub";
+        let (blocks, headings) = crate::markdown::blocks::lower_with_headings(source);
+        let area = Rect::new(0, 0, 40, 6);
+        let (_, main_area) = split_areas(area, true);
+        let layout_doc = layout::layout(&blocks, main_area.width as usize);
+        let toc = crate::toc::resolve(&headings, &layout_doc);
+
+        let mut app = App::new(layout_doc.total_rows);
+        app.toc_open = true;
+        app.toc_focused = true;
+        app.toc_selected = 1;
+
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, &app, &blocks, &toc))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        // Sidebar has a bordered box titled "Outline" with each entry
+        // indented by heading level; the selected entry (index 1) is
+        // reverse-styled.
+        let title_row: String = (0..12)
+            .map(|x| buffer.cell((x, 0)).unwrap().symbol().to_string())
+            .collect();
+        assert!(title_row.contains("Outline"), "got: {title_row:?}");
+
+        // Row 2 is "Section One" (index 1, selected); indented 2 spaces
+        // for its level-2 heading. Row 1 ("Title") is unselected.
+        let selected_cell = buffer.cell((3, 2)).unwrap();
+        assert!(
+            selected_cell
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED),
+            "selected TOC entry should be reverse-styled"
+        );
+        let unselected_cell = buffer.cell((1, 1)).unwrap();
+        assert!(
+            !unselected_cell
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED),
+            "unselected TOC entries should not be reverse-styled"
+        );
+    }
 
     #[test]
     fn headings_render_with_distinct_styles_and_rules() {
@@ -47,7 +223,9 @@ mod tests {
         let backend = TestBackend::new(20, 8);
         let mut terminal = Terminal::new(backend).unwrap();
         let app = App::new(0);
-        terminal.draw(|frame| render(frame, &app, &blocks)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &app, &blocks, &[]))
+            .unwrap();
 
         let buffer = terminal.backend().buffer();
 
@@ -145,7 +323,9 @@ mod tests {
         let backend = TestBackend::new(30, 8);
         let mut terminal = Terminal::new(backend).unwrap();
         let app = App::new(0);
-        terminal.draw(|frame| render(frame, &app, &blocks)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &app, &blocks, &[]))
+            .unwrap();
 
         let buffer = terminal.backend().buffer();
         // Rows 2-4 are the code block's three lines (row 0: heading text,
@@ -166,7 +346,9 @@ mod tests {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         let app = App::new(0);
-        terminal.draw(|frame| render(frame, &app, blocks)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &app, blocks, &[]))
+            .unwrap();
         let buffer = terminal.backend().buffer();
         (0..height)
             .map(|y| {
