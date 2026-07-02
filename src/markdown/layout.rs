@@ -1,7 +1,7 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::markdown::blocks::{Block, Inline};
+use crate::markdown::blocks::{Block, ColumnAlignment, Inline};
 use crate::theme;
 
 /// One block's assigned position in the document's virtual row space.
@@ -115,31 +115,173 @@ fn render_block(block: &Block, width: usize, out: &mut Vec<Line<'static>>) {
         }
         Block::List { ordered, items } => {
             for (i, item) in items.iter().enumerate() {
-                let bullet = if *ordered {
-                    format!("{}. ", i + 1)
-                } else {
-                    "\u{2022} ".to_string()
+                // A task list item wraps its content and carries checked
+                // state; unwrap it here so its checkbox glyph replaces
+                // the normal bullet instead of showing both.
+                let (bullet, content): (String, &[Block]) = match item.first() {
+                    Some(Block::TaskListItem { checked, content }) => {
+                        (task_glyph(*checked), content.as_slice())
+                    }
+                    _ => {
+                        let glyph = if *ordered {
+                            format!("{}. ", i + 1)
+                        } else {
+                            "\u{2022} ".to_string()
+                        };
+                        (glyph, item.as_slice())
+                    }
                 };
-                let bullet_width = bullet.chars().count();
-                // Uses the full width (not narrowed for the bullet) so
-                // the bullet doesn't shift wrap points relative to row
-                // counts.
-                let mut item_lines = Vec::new();
-                for b in item {
-                    render_block(b, width, &mut item_lines);
-                }
-                for (j, line) in item_lines.into_iter().enumerate() {
-                    let prefix = if j == 0 {
-                        bullet.clone()
-                    } else {
-                        " ".repeat(bullet_width)
-                    };
-                    let mut spans = vec![Span::raw(prefix)];
-                    spans.extend(line.spans);
-                    out.push(Line::from(spans));
-                }
+                render_list_item(&bullet, content, width, out);
             }
         }
+        Block::TaskListItem { checked, content } => {
+            render_list_item(&task_glyph(*checked), content, width, out);
+        }
+        Block::FootnoteDefinition { label, content } => {
+            render_list_item(&format!("[^{label}]: "), content, width, out);
+        }
+        Block::Table {
+            alignments,
+            header,
+            rows,
+        } => render_table(alignments, header, rows, width, out),
+    }
+}
+
+/// Renders a table as aligned columns. v1 simplification: cells are
+/// single-line plain text (no inline styling, no per-cell wrapping) — a
+/// row that exceeds the viewport is truncated rather than reflowed,
+/// mirroring the width tradeoff already made for blockquotes/lists.
+fn render_table(
+    alignments: &[ColumnAlignment],
+    header: &[Vec<Inline>],
+    rows: &[Vec<Vec<Inline>>],
+    width: usize,
+    out: &mut Vec<Line<'static>>,
+) {
+    let column_count = header.len();
+    let header_text: Vec<String> = header.iter().map(|c| flatten_plain(c)).collect();
+    let row_texts: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| r.iter().map(|c| flatten_plain(c)).collect())
+        .collect();
+
+    let mut col_widths = vec![0usize; column_count];
+    for (i, cell) in header_text.iter().enumerate() {
+        col_widths[i] = col_widths[i].max(cell.chars().count());
+    }
+    for row in &row_texts {
+        for (i, cell) in row.iter().enumerate().take(column_count) {
+            col_widths[i] = col_widths[i].max(cell.chars().count());
+        }
+    }
+
+    let header_style = Style::new().add_modifier(Modifier::BOLD);
+    out.push(render_table_row(
+        &header_text,
+        &col_widths,
+        alignments,
+        header_style,
+        width,
+    ));
+    out.push(Line::from(Span::raw(table_separator(&col_widths, width))));
+    for row in &row_texts {
+        out.push(render_table_row(
+            row,
+            &col_widths,
+            alignments,
+            Style::default(),
+            width,
+        ));
+    }
+}
+
+fn flatten_plain(inlines: &[Inline]) -> String {
+    let mut out = String::new();
+    for inline in inlines {
+        match inline {
+            Inline::Text(text) => out.push_str(text),
+            Inline::Bold(inner)
+            | Inline::Italic(inner)
+            | Inline::Strikethrough(inner)
+            | Inline::Link { text: inner, .. } => out.push_str(&flatten_plain(inner)),
+            Inline::FootnoteReference(label) => out.push_str(&format!("[^{label}]")),
+        }
+    }
+    out
+}
+
+fn pad_cell(text: &str, col_width: usize, alignment: ColumnAlignment) -> String {
+    let pad = col_width.saturating_sub(text.chars().count());
+    match alignment {
+        ColumnAlignment::Right => format!("{}{text}", " ".repeat(pad)),
+        ColumnAlignment::Center => {
+            let left = pad / 2;
+            let right = pad - left;
+            format!("{}{text}{}", " ".repeat(left), " ".repeat(right))
+        }
+        ColumnAlignment::None | ColumnAlignment::Left => format!("{text}{}", " ".repeat(pad)),
+    }
+}
+
+fn render_table_row(
+    cells: &[String],
+    col_widths: &[usize],
+    alignments: &[ColumnAlignment],
+    style: Style,
+    width: usize,
+) -> Line<'static> {
+    let mut rendered = String::new();
+    for (i, cell) in cells.iter().enumerate() {
+        if i > 0 {
+            rendered.push_str(" \u{2502} ");
+        }
+        let align = alignments.get(i).copied().unwrap_or(ColumnAlignment::None);
+        let col_width = col_widths.get(i).copied().unwrap_or(cell.chars().count());
+        rendered.push_str(&pad_cell(cell, col_width, align));
+    }
+    let truncated: String = rendered.chars().take(width.max(1)).collect();
+    Line::from(Span::styled(truncated, style))
+}
+
+fn table_separator(col_widths: &[usize], width: usize) -> String {
+    let mut sep = String::new();
+    for (i, col_width) in col_widths.iter().enumerate() {
+        if i > 0 {
+            sep.push_str("\u{2500}\u{253C}\u{2500}");
+        }
+        sep.push_str(&"\u{2500}".repeat(*col_width));
+    }
+    sep.chars().take(width.max(1)).collect()
+}
+
+fn task_glyph(checked: bool) -> String {
+    if checked {
+        "\u{2611} ".to_string()
+    } else {
+        "\u{2610} ".to_string()
+    }
+}
+
+/// Renders a list item's blocks with `bullet` prefixed on the first line
+/// and blank padding aligning continuation lines under it.
+fn render_list_item(bullet: &str, content: &[Block], width: usize, out: &mut Vec<Line<'static>>) {
+    let bullet_width = bullet.chars().count();
+    // Uses the full width (not narrowed for the bullet) so the bullet
+    // doesn't shift wrap points relative to row counts.
+    let mut item_lines = Vec::new();
+    for b in content {
+        render_block(b, width, &mut item_lines);
+    }
+    for (j, line) in item_lines.into_iter().enumerate() {
+        let prefix = if j == 0 {
+            bullet.to_string()
+        } else {
+            " ".repeat(bullet_width)
+        };
+        let mut spans = vec![Span::raw(prefix)];
+        spans.extend(line.spans);
+        out.push(Line::from(spans));
     }
 }
 
@@ -163,8 +305,15 @@ fn collect_words(inlines: &[Inline], style: Style, out: &mut Vec<(String, Style)
             Inline::Italic(inner) => {
                 collect_words(inner, style.add_modifier(Modifier::ITALIC), out)
             }
+            Inline::Strikethrough(inner) => {
+                collect_words(inner, style.add_modifier(Modifier::CROSSED_OUT), out)
+            }
             Inline::Link { text, .. } => {
                 collect_words(text, style.add_modifier(Modifier::UNDERLINED), out)
+            }
+            Inline::FootnoteReference(label) => {
+                let marker_style = style.fg(Color::Cyan).add_modifier(Modifier::BOLD);
+                out.push((format!("[^{label}]"), marker_style));
             }
         }
     }

@@ -1,4 +1,4 @@
-use pulldown_cmark::{CodeBlockKind, Event as CmEvent, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event as CmEvent, Tag, TagEnd};
 
 use crate::markdown::parser;
 
@@ -7,7 +7,17 @@ pub enum Inline {
     Text(String),
     Bold(Vec<Inline>),
     Italic(Vec<Inline>),
+    Strikethrough(Vec<Inline>),
     Link { text: Vec<Inline>, url: String },
+    FootnoteReference(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnAlignment {
+    None,
+    Left,
+    Center,
+    Right,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -27,6 +37,19 @@ pub enum Block {
         ordered: bool,
         items: Vec<Vec<Block>>,
     },
+    TaskListItem {
+        checked: bool,
+        content: Vec<Block>,
+    },
+    FootnoteDefinition {
+        label: String,
+        content: Vec<Block>,
+    },
+    Table {
+        alignments: Vec<ColumnAlignment>,
+        header: Vec<Vec<Inline>>,
+        rows: Vec<Vec<Vec<Inline>>>,
+    },
 }
 
 /// Lowers CommonMark `source` into an owned `Vec<Block>`.
@@ -43,12 +66,26 @@ pub fn lower(source: &str) -> Vec<Block> {
     let mut link_urls: Vec<String> = Vec::new();
     let mut code_block: Option<(Option<String>, String)> = None;
     let mut list_stack: Vec<(bool, Vec<Vec<Block>>)> = Vec::new();
+    // `TaskListMarker` can land directly under `Item` (tight lists) or
+    // inside the item's `Paragraph` (loose lists) — either way, it always
+    // fires while that item's frame is on top, so a stack scoped per-item
+    // catches both shapes without caring which one it is.
+    let mut task_marker_stack: Vec<Option<bool>> = Vec::new();
+    let mut footnote_labels: Vec<String> = Vec::new();
+    let mut table_alignments: Vec<ColumnAlignment> = Vec::new();
+    let mut table_header: Vec<Vec<Inline>> = Vec::new();
+    let mut table_rows: Vec<Vec<Vec<Inline>>> = Vec::new();
+    let mut table_current_row: Vec<Vec<Inline>> = Vec::new();
 
     for event in parser::parse(source) {
         match event {
-            CmEvent::Start(Tag::Paragraph | Tag::Heading { .. } | Tag::Strong | Tag::Emphasis) => {
-                stack.push(Vec::new())
-            }
+            CmEvent::Start(
+                Tag::Paragraph
+                | Tag::Heading { .. }
+                | Tag::Strong
+                | Tag::Emphasis
+                | Tag::Strikethrough,
+            ) => stack.push(Vec::new()),
             CmEvent::Start(Tag::Link { dest_url, .. }) => {
                 link_urls.push(dest_url.into_string());
                 stack.push(Vec::new());
@@ -65,6 +102,40 @@ pub fn lower(source: &str) -> Vec<Block> {
                 flush_pending_item_text(&mut stack, &mut blocks, &mut containers);
                 containers.push(Vec::new());
             }
+            CmEvent::Start(Tag::FootnoteDefinition(label)) => {
+                flush_pending_item_text(&mut stack, &mut blocks, &mut containers);
+                footnote_labels.push(label.into_string());
+                containers.push(Vec::new());
+            }
+            CmEvent::FootnoteReference(label) => {
+                push_inline(&mut stack, Inline::FootnoteReference(label.into_string()));
+            }
+            CmEvent::Start(Tag::Table(alignments)) => {
+                flush_pending_item_text(&mut stack, &mut blocks, &mut containers);
+                table_alignments = alignments.iter().map(|a| column_alignment(*a)).collect();
+            }
+            CmEvent::Start(Tag::TableCell) => stack.push(Vec::new()),
+            CmEvent::End(TagEnd::TableCell) => {
+                let cell = stack.pop().unwrap_or_default();
+                table_current_row.push(cell);
+            }
+            CmEvent::End(TagEnd::TableHead) => {
+                table_header = std::mem::take(&mut table_current_row);
+            }
+            CmEvent::End(TagEnd::TableRow) => {
+                table_rows.push(std::mem::take(&mut table_current_row));
+            }
+            CmEvent::End(TagEnd::Table) => {
+                push_block(
+                    &mut blocks,
+                    &mut containers,
+                    Block::Table {
+                        alignments: std::mem::take(&mut table_alignments),
+                        header: std::mem::take(&mut table_header),
+                        rows: std::mem::take(&mut table_rows),
+                    },
+                );
+            }
             CmEvent::Start(Tag::List(first_item_number)) => {
                 flush_pending_item_text(&mut stack, &mut blocks, &mut containers);
                 list_stack.push((first_item_number.is_some(), Vec::new()))
@@ -76,13 +147,25 @@ pub fn lower(source: &str) -> Vec<Block> {
             CmEvent::Start(Tag::Item) => {
                 containers.push(Vec::new());
                 stack.push(Vec::new());
+                task_marker_stack.push(None);
+            }
+            CmEvent::TaskListMarker(checked) => {
+                if let Some(top) = task_marker_stack.last_mut() {
+                    *top = Some(checked);
+                }
             }
             CmEvent::End(TagEnd::Item) => {
                 let direct_text = stack.pop().unwrap_or_default();
                 if !direct_text.is_empty() {
                     push_block(&mut blocks, &mut containers, Block::Paragraph(direct_text));
                 }
-                let item = containers.pop().unwrap_or_default();
+                let mut item = containers.pop().unwrap_or_default();
+                if let Some(Some(checked)) = task_marker_stack.pop() {
+                    item = vec![Block::TaskListItem {
+                        checked,
+                        content: item,
+                    }];
+                }
                 if let Some((_, items)) = list_stack.last_mut() {
                     items.push(item);
                 }
@@ -120,6 +203,10 @@ pub fn lower(source: &str) -> Vec<Block> {
                 let inner = stack.pop().unwrap_or_default();
                 push_inline(&mut stack, Inline::Italic(inner));
             }
+            CmEvent::End(TagEnd::Strikethrough) => {
+                let inner = stack.pop().unwrap_or_default();
+                push_inline(&mut stack, Inline::Strikethrough(inner));
+            }
             CmEvent::End(TagEnd::Link) => {
                 let text = stack.pop().unwrap_or_default();
                 if let Some(url) = link_urls.pop() {
@@ -129,6 +216,16 @@ pub fn lower(source: &str) -> Vec<Block> {
             CmEvent::End(TagEnd::BlockQuote(_)) => {
                 let inner = containers.pop().unwrap_or_default();
                 push_block(&mut blocks, &mut containers, Block::Blockquote(inner));
+            }
+            CmEvent::End(TagEnd::FootnoteDefinition) => {
+                let content = containers.pop().unwrap_or_default();
+                if let Some(label) = footnote_labels.pop() {
+                    push_block(
+                        &mut blocks,
+                        &mut containers,
+                        Block::FootnoteDefinition { label, content },
+                    );
+                }
             }
             CmEvent::Text(text) => {
                 if let Some((_, code)) = code_block.as_mut() {
@@ -143,6 +240,15 @@ pub fn lower(source: &str) -> Vec<Block> {
     }
 
     blocks
+}
+
+fn column_alignment(alignment: Alignment) -> ColumnAlignment {
+    match alignment {
+        Alignment::None => ColumnAlignment::None,
+        Alignment::Left => ColumnAlignment::Left,
+        Alignment::Center => ColumnAlignment::Center,
+        Alignment::Right => ColumnAlignment::Right,
+    }
 }
 
 fn push_inline(stack: &mut [Vec<Inline>], inline: Inline) {
@@ -233,6 +339,19 @@ mod tests {
     }
 
     #[test]
+    fn strikethrough_run_lowers_as_a_nested_inline() {
+        let blocks = lower("This is ~~struck~~ text.");
+        assert_eq!(
+            blocks,
+            vec![Block::Paragraph(vec![
+                Inline::Text("This is ".to_string()),
+                Inline::Strikethrough(vec![Inline::Text("struck".to_string())]),
+                Inline::Text(" text.".to_string()),
+            ])]
+        );
+    }
+
+    #[test]
     fn unordered_and_ordered_lists_lower_with_item_paragraphs() {
         let blocks = lower("- one\n- two");
         assert_eq!(
@@ -257,6 +376,32 @@ mod tests {
                 ],
             }]
         );
+    }
+
+    #[test]
+    fn task_list_items_lower_with_their_checked_state() {
+        let tight = lower("- [x] done\n- [ ] not done");
+        assert_eq!(
+            tight,
+            vec![Block::List {
+                ordered: false,
+                items: vec![
+                    vec![Block::TaskListItem {
+                        checked: true,
+                        content: vec![Block::Paragraph(vec![Inline::Text("done".to_string())])],
+                    }],
+                    vec![Block::TaskListItem {
+                        checked: false,
+                        content: vec![Block::Paragraph(vec![Inline::Text("not done".to_string())])],
+                    }],
+                ],
+            }]
+        );
+
+        // Loose lists (blank line between items) wrap content in an
+        // explicit Paragraph before the marker; the shape must match.
+        let loose = lower("- [x] done\n\n- [ ] not done");
+        assert_eq!(loose, tight);
     }
 
     #[test]
@@ -332,6 +477,52 @@ mod tests {
                 },
                 Inline::Text(" for more.".to_string()),
             ])]
+        );
+    }
+
+    #[test]
+    fn footnote_reference_lowers_as_an_inline_marker() {
+        let blocks = lower("A note[^1].\n\n[^1]: The footnote text.");
+        assert_eq!(
+            blocks,
+            vec![
+                Block::Paragraph(vec![
+                    Inline::Text("A note".to_string()),
+                    Inline::FootnoteReference("1".to_string()),
+                    Inline::Text(".".to_string()),
+                ]),
+                Block::FootnoteDefinition {
+                    label: "1".to_string(),
+                    content: vec![Block::Paragraph(vec![Inline::Text(
+                        "The footnote text.".to_string()
+                    )])],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn table_lowers_with_alignments_header_and_rows() {
+        let blocks = lower("| a | b |\n| --- | :---: |\n| 1 | 2 |\n| 3 | 4 |");
+        assert_eq!(
+            blocks,
+            vec![Block::Table {
+                alignments: vec![ColumnAlignment::None, ColumnAlignment::Center],
+                header: vec![
+                    vec![Inline::Text("a".to_string())],
+                    vec![Inline::Text("b".to_string())],
+                ],
+                rows: vec![
+                    vec![
+                        vec![Inline::Text("1".to_string())],
+                        vec![Inline::Text("2".to_string())],
+                    ],
+                    vec![
+                        vec![Inline::Text("3".to_string())],
+                        vec![Inline::Text("4".to_string())],
+                    ],
+                ],
+            }]
         );
     }
 }

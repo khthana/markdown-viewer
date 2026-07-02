@@ -82,20 +82,7 @@ mod tests {
         let source = "# H1\n\nSome paragraph text.\n\n- item one\n- item two\n\n\
                        > A quote\n\n1. first\n2. second\n\n---\n\n```\ncode line\n```";
         let blocks = crate::markdown::blocks::lower(source);
-
-        let backend = TestBackend::new(20, 18);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let app = App::new(0);
-        terminal.draw(|frame| render(frame, &app, &blocks)).unwrap();
-
-        let buffer = terminal.backend().buffer();
-        let rows: Vec<String> = (0..18)
-            .map(|y| {
-                (0..20)
-                    .map(|x| buffer.cell((x, y)).unwrap().symbol().to_string())
-                    .collect::<String>()
-            })
-            .collect();
+        let rows = render_to_rows(&blocks, 20, 18);
 
         assert_eq!(
             rows,
@@ -120,5 +107,48 @@ mod tests {
                 "                    ",
             ]
         );
+    }
+
+    #[test]
+    fn gfm_snapshot_across_tables_task_lists_strikethrough_footnotes() {
+        let source = "| a | b |\n| --- | :---: |\n| 1 | 22 |\n\n\
+                       - [x] done\n- [ ] todo\n\n\
+                       ~~struck~~ text.\n\n\
+                       A note[^1].\n\n[^1]: The footnote.";
+        let blocks = crate::markdown::blocks::lower(source);
+        let rows = render_to_rows(&blocks, 30, 12);
+
+        assert_eq!(
+            rows,
+            vec![
+                "a │ b                         ",
+                "──┼───                        ",
+                "1 │ 22                        ",
+                "☑ done                        ",
+                "☐ todo                        ",
+                "struck text.                  ",
+                "A note [^1] .                 ",
+                "[^1]: The footnote.           ",
+                "                              ",
+                "                              ",
+                "                              ",
+                "                              ",
+            ]
+        );
+    }
+
+    fn render_to_rows(blocks: &[Block], width: u16, height: u16) -> Vec<String> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let app = App::new(0);
+        terminal.draw(|frame| render(frame, &app, blocks)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
     }
 }
