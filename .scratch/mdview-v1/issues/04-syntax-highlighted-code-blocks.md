@@ -23,3 +23,9 @@ Fenced code blocks (` ```lang `) render with syntax highlighting by language, us
 ## Blocked by
 
 - 02-core-markdown-rendering
+
+## Comments
+
+Implemented without the `syntect-tui` dependency. Its latest published version (3.0.6) pins `ratatui ^0.29.0` as a real dependency, which is a different crate instance than this project's `ratatui 0.30.1` — `into_span`'s returned `Span` doesn't type-check against our pipeline, and there's no newer version targeting 0.30. Its default features (`deep-defaults`) also pull in `onig` (C/Oniguruma), which is a known slow/fragile build on `windows-latest` CI. Downgrading the project to ratatui 0.29 to keep it wasn't worth discarding completed work over.
+
+Used `syntect` directly (`default-features = false, features = ["default-fancy"]` to keep the pure-Rust `fancy-regex` engine, avoiding `onig`) with a ~15-line local `syntect::highlighting::Style -> ratatui::style::Style` conversion in `highlight.rs` instead. Foreground color only — background is dropped since a theme's background fights the terminal's own and looks wrong in a pager.

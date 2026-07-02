@@ -91,11 +91,8 @@ fn render_block(block: &Block, width: usize, out: &mut Vec<Line<'static>>) {
         Block::HorizontalRule => {
             out.push(Line::from(Span::raw("─".repeat(width.max(1)))));
         }
-        Block::Code { text, .. } => {
-            let style = Style::new().fg(Color::DarkGray);
-            for line in text.lines() {
-                out.push(Line::from(Span::styled(line.to_string(), style)));
-            }
+        Block::Code { lang, text } => {
+            out.extend(crate::highlight::highlight_code(text, lang.as_deref()));
         }
         Block::Blockquote(inner) => {
             // Uses the full width (not narrowed for the "│ " prefix) so

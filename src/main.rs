@@ -1,6 +1,7 @@
 mod app;
 mod cli;
 mod event;
+mod highlight;
 mod markdown;
 mod theme;
 mod ui;

@@ -137,6 +137,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn snapshot_with_a_highlighted_code_block_shows_more_than_one_token_color() {
+        let source = "# Example\n\n```rust\nfn main() {\n    let s = \"hi\"; // greet\n}\n```";
+        let blocks = crate::markdown::blocks::lower(source);
+
+        let backend = TestBackend::new(30, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let app = App::new(0);
+        terminal.draw(|frame| render(frame, &app, &blocks)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        // Rows 2-4 are the code block's three lines (row 0: heading text,
+        // row 1: heading rule).
+        let code_fg_colors: std::collections::HashSet<_> = (2..5)
+            .flat_map(|y| (0..30).map(move |x| (x, y)))
+            .filter_map(|(x, y)| buffer.cell((x, y)))
+            .map(|cell| cell.style().fg)
+            .collect();
+
+        assert!(
+            code_fg_colors.len() > 1,
+            "expected multiple distinct token colors in the code block, got {code_fg_colors:?}"
+        );
+    }
+
     fn render_to_rows(blocks: &[Block], width: u16, height: u16) -> Vec<String> {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
