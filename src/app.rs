@@ -47,6 +47,7 @@ pub enum Action {
     ExitSearch,
     NextMatch,
     PrevMatch,
+    Reload,
 }
 
 /// Pure decision function: given the current state and a keypress, what
@@ -73,10 +74,11 @@ pub fn handle_key(state: &AppState, key: KeyEvent) -> Action {
         };
     }
 
-    // Tab and quit are global, regardless of TOC focus.
+    // Tab, quit, and reload are global, regardless of TOC focus.
     match key.code {
         KeyCode::Tab => return Action::ToggleToc,
         KeyCode::Char('q') => return Action::Quit,
+        KeyCode::Char('r') => return Action::Reload,
         _ => {}
     }
 
@@ -106,6 +108,23 @@ pub fn handle_key(state: &AppState, key: KeyEvent) -> Action {
         KeyCode::Char('N') => Action::PrevMatch,
         _ => Action::None,
     }
+}
+
+/// The deepest scroll offset that still leaves the viewport full. Shared
+/// with `reload` so the clamp rule can't drift between the pager and the
+/// position restored after a reload.
+pub fn max_scroll(total_rows: usize, viewport_height: usize) -> usize {
+    total_rows.saturating_sub(viewport_height.max(1))
+}
+
+/// What the main loop should do after a keypress. `Reload` exists
+/// because re-reading the file is I/O the pure `App` state deliberately
+/// doesn't own — the caller performs it and hands back a fresh document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyOutcome {
+    Continue,
+    Quit,
+    Reload,
 }
 
 /// Owns the mutable pager state: current scroll offset, viewport height,
@@ -151,15 +170,20 @@ impl App {
     }
 
     fn max_scroll(&self) -> usize {
-        self.total_rows.saturating_sub(self.viewport_height.max(1))
+        max_scroll(self.total_rows, self.viewport_height)
     }
 
     /// Handles a keypress: decides the action, applies it, and updates the
     /// `gg`-sequence flag. `toc` is the currently resolved TOC entries (for
     /// selection bounds and jump targets); `matches` is the current
     /// search's resolved match list (for jump targets and next/prev
-    /// navigation). Returns `true` if the app should quit.
-    pub fn on_key(&mut self, key: KeyEvent, toc: &[TocEntry], matches: &[search::Match]) -> bool {
+    /// navigation). Returns what the main loop should do next.
+    pub fn on_key(
+        &mut self,
+        key: KeyEvent,
+        toc: &[TocEntry],
+        matches: &[search::Match],
+    ) -> KeyOutcome {
         let state = AppState {
             pending_g: self.pending_g,
             toc_focused: self.toc_focused,
@@ -179,7 +203,8 @@ impl App {
             }
             Action::Top => self.scroll = 0,
             Action::Bottom => self.scroll = self.max_scroll(),
-            Action::Quit => return true,
+            Action::Quit => return KeyOutcome::Quit,
+            Action::Reload => return KeyOutcome::Reload,
             // Closed -> open+focused; open+focused -> closed; open+unfocused
             // (right after a jump) -> re-focused. This is what makes "peek,
             // jump, peek again" work without needing to close and reopen.
@@ -244,7 +269,7 @@ impl App {
             }
             Action::None => {}
         }
-        false
+        KeyOutcome::Continue
     }
 }
 
@@ -478,10 +503,16 @@ mod tests {
         app.viewport_height = 10;
         app.scroll = 50;
 
-        assert!(!app.on_key(key(KeyCode::Char('g')), &[], &[]));
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('g')), &[], &[]),
+            KeyOutcome::Continue
+        );
         assert_eq!(app.scroll, 50, "first g should not move the scroll yet");
 
-        assert!(!app.on_key(key(KeyCode::Char('g')), &[], &[]));
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('g')), &[], &[]),
+            KeyOutcome::Continue
+        );
         assert_eq!(app.scroll, 0, "second g completes gg and scrolls to top");
     }
 
@@ -505,9 +536,23 @@ mod tests {
     }
 
     #[test]
-    fn app_quit_returns_true() {
+    fn app_quit_returns_quit() {
         let mut app = App::new(1);
-        assert!(app.on_key(key(KeyCode::Char('q')), &[], &[]));
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('q')), &[], &[]),
+            KeyOutcome::Quit
+        );
+    }
+
+    #[test]
+    fn app_r_asks_the_caller_to_reload() {
+        let mut app = App::new(10);
+        app.viewport_height = 5;
+
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('r')), &[], &[]),
+            KeyOutcome::Reload
+        );
     }
 
     #[test]
@@ -675,5 +720,39 @@ mod tests {
         assert_eq!(app.search_query, "");
         assert!(!app.search_active);
         assert_eq!(app.current_match, None);
+    }
+
+    #[test]
+    fn r_reloads_the_document() {
+        assert_eq!(
+            handle_key(&state(false), key(KeyCode::Char('r'))),
+            Action::Reload
+        );
+    }
+
+    #[test]
+    fn r_typed_into_a_search_query_is_text_not_a_reload() {
+        let searching = AppState {
+            pending_g: false,
+            toc_focused: false,
+            mode: Mode::Search,
+        };
+        assert_eq!(
+            handle_key(&searching, key(KeyCode::Char('r'))),
+            Action::SearchInput('r')
+        );
+    }
+
+    #[test]
+    fn r_reloads_even_while_the_toc_is_focused() {
+        let focused = AppState {
+            pending_g: false,
+            toc_focused: true,
+            mode: Mode::Normal,
+        };
+        assert_eq!(
+            handle_key(&focused, key(KeyCode::Char('r'))),
+            Action::Reload
+        );
     }
 }
