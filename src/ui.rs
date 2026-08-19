@@ -1,9 +1,10 @@
 use ratatui::Frame;
-use ratatui::layout::{Rect, Size};
+use ratatui::layout::Rect;
+use ratatui::layout::Size;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block as RatBlock, Borders, List, ListItem, Paragraph};
-use ratatui_image::Image as RatatuiImage;
+use ratatui_image::StatefulImage;
 
 use crate::app::{App, Mode};
 use crate::image::{Gallery, Sizing};
@@ -209,22 +210,38 @@ fn render_images(
             height: (last_row.min(viewport.end) - top) as u16,
         };
 
-        let protocol = fully_visible
-            .then(|| gallery.protocol(images, path, Size::new(area.width, area.height)))
-            .flatten();
-        match protocol {
-            Some(protocol) => frame.render_widget(RatatuiImage::new(protocol), area),
-            None => frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    blocks::image_placeholder(alt, path),
-                    theme::image_placeholder_style(),
-                ))),
-                Rect {
-                    width: content_area.width,
-                    ..area
-                },
-            ),
+        // Asking is what starts the decode: an image is only fetched once
+        // the reader has actually scrolled to it.
+        let id = gallery.id_for(laid_out.block_index);
+        if fully_visible {
+            gallery.request(id, images, path);
+            // Rendering is also what posts the encode job, so the widget
+            // goes out either way — but on the frames where that's all it
+            // does, it paints nothing and the placeholder has to stand in.
+            let paints = gallery.paints_now(id, Size::new(area.width, area.height));
+            if let Some(protocol) = gallery.protocol_mut(id) {
+                frame.render_stateful_widget(
+                    StatefulImage::default().resize(crate::image::IMAGE_RESIZE),
+                    area,
+                    protocol,
+                );
+                if paints {
+                    continue;
+                }
+            }
         }
+
+        // Still decoding, still encoding, undecodable, or half off screen.
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                blocks::image_placeholder(alt, path),
+                theme::image_placeholder_style(),
+            ))),
+            Rect {
+                width: content_area.width,
+                ..area
+            },
+        );
     }
 }
 
@@ -315,7 +332,7 @@ mod tests {
                 matches,
                 image_sizing: &images,
             },
-            &mut Gallery::new(None),
+            &mut Gallery::disabled(),
         );
     }
     use crate::markdown::blocks::Inline;
@@ -817,72 +834,24 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_drawable_image_is_painted_into_the_rows_reserved_for_it() {
-        use ratatui::style::Color;
-        use ratatui_image::FontSize;
-        use ratatui_image::picker::Picker;
-
-        let dir = std::env::temp_dir().join(format!("mdview-ui-image-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("red.png");
-        ::image::RgbImage::from_pixel(40, 40, ::image::Rgb([255, 0, 0]))
-            .save(&file)
-            .unwrap();
-
-        let blocks = crate::markdown::blocks::lower("![Alt](red.png)");
-        let images = Sizing::measure(&dir, FontSize::new(10, 20), ["red.png"]);
-        let layout_doc = layout::layout(&blocks, 20, &images);
-        let mut gallery = Gallery::new(Some(Picker::halfblocks()));
-        let mut app = App::new(layout_doc.total_rows);
-        app.viewport_height = 5;
-
-        let backend = TestBackend::new(20, 5);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| {
-                render(
-                    frame,
-                    Screen {
-                        app: &app,
-                        blocks: &blocks,
-                        layout_doc: &layout_doc,
-                        toc: &[],
-                        matches: &[],
-                        image_sizing: &images,
-                    },
-                    &mut gallery,
-                )
-            })
-            .unwrap();
-
-        // 40x40 px at a 10x20 cell is 4 cols by 2 rows of half-blocks.
-        assert_eq!(layout_doc.total_rows, 2);
-        let buffer = terminal.backend().buffer();
-        let painted = (0..4).any(|x| {
-            (0..2).any(|y| {
-                let style = buffer.cell((x, y)).unwrap().style();
-                style.fg.is_some_and(|color| color != Color::Reset)
-                    || style.bg.is_some_and(|color| color != Color::Reset)
-            })
-        });
-        assert!(
-            painted,
-            "the image's rows should carry the picture's colours"
-        );
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
     /// A document with a picture in it, written to a scratch directory.
     fn image_fixture(name: &str, source: &str) -> (std::path::PathBuf, Vec<Block>, Sizing) {
         use ratatui_image::FontSize;
 
         let dir = std::env::temp_dir().join(format!("mdview-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        ::image::RgbImage::from_pixel(40, 40, ::image::Rgb([255, 0, 0]))
-            .save(dir.join("red.png"))
-            .unwrap();
+        // Ten-pixel stripes: each half-block cell then has a different
+        // colour above and below, which is what makes the tier draw a
+        // glyph rather than a blank cell in one flat colour.
+        ::image::RgbImage::from_fn(40, 40, |_, y| {
+            if (y / 10) % 2 == 0 {
+                ::image::Rgb([255, 0, 0])
+            } else {
+                ::image::Rgb([0, 0, 255])
+            }
+        })
+        .save(dir.join("red.png"))
+        .unwrap();
 
         let blocks = crate::markdown::blocks::lower(source);
         let images = Sizing::measure(&dir, FontSize::new(10, 20), ["red.png"]);
@@ -895,33 +864,180 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn text_after_an_image_starts_below_the_rows_the_picture_reserved() {
+    /// Does what the image thread would: decodes what was asked for and
+    /// re-encodes what the last render asked to resize.
+    fn work(gallery: &mut Gallery, jobs: &std::sync::mpsc::Receiver<crate::image::Job>) -> bool {
+        use crate::image::Job;
         use ratatui_image::picker::Picker;
 
-        let (dir, blocks, images) = image_fixture("ui-image-after", "![Alt](red.png)\n\nAfter it.");
-        let layout_doc = layout::layout(&blocks, 20, &images);
-        let mut gallery = Gallery::new(Some(Picker::halfblocks()));
-        let mut app = App::new(layout_doc.total_rows);
-        app.viewport_height = 5;
+        let mut worked = false;
+        while let Ok(job) = jobs.try_recv() {
+            worked = true;
+            match job {
+                Job::Decode { id, file } => {
+                    let protocol = crate::image::decode_protocol(&Picker::halfblocks(), &file);
+                    gallery.image_decoded(id, protocol);
+                }
+                Job::Resize { id, request } => {
+                    let response = request.resize_encode().expect("the image re-encodes");
+                    gallery.image_resized(id, response);
+                }
+            }
+        }
+        worked
+    }
 
-        let mut terminal = Terminal::new(TestBackend::new(20, 5)).unwrap();
+    fn draw(
+        terminal: &mut Terminal<TestBackend>,
+        app: &App,
+        blocks: &[Block],
+        layout_doc: &LayoutDoc,
+        images: &Sizing,
+        gallery: &mut Gallery,
+    ) {
         terminal
             .draw(|frame| {
                 render(
                     frame,
                     Screen {
-                        app: &app,
-                        blocks: &blocks,
-                        layout_doc: &layout_doc,
+                        app,
+                        blocks,
+                        layout_doc,
                         toc: &[],
                         matches: &[],
-                        image_sizing: &images,
+                        image_sizing: images,
                     },
-                    &mut gallery,
+                    gallery,
                 )
             })
             .unwrap();
+        gallery.dispatch_resizes();
+    }
+
+    /// Draws until the picture has actually made it onto the screen:
+    /// render, let the worker answer, render again.
+    fn draw_until_settled(
+        terminal: &mut Terminal<TestBackend>,
+        app: &App,
+        blocks: &[Block],
+        layout_doc: &LayoutDoc,
+        images: &Sizing,
+        gallery: &mut Gallery,
+        jobs: &std::sync::mpsc::Receiver<crate::image::Job>,
+    ) {
+        for _ in 0..4 {
+            draw(terminal, app, blocks, layout_doc, images, gallery);
+            if !work(gallery, jobs) {
+                break;
+            }
+        }
+        draw(terminal, app, blocks, layout_doc, images, gallery);
+    }
+
+    /// Whether the half-block tier has actually painted here: it draws
+    /// upper-half-block glyphs, which nothing else in the viewer uses.
+    fn is_painted(buffer: &ratatui::buffer::Buffer, cols: u16, rows: u16) -> bool {
+        (0..cols).any(|x| {
+            (0..rows).any(|y| {
+                matches!(
+                    buffer.cell((x, y)).unwrap().symbol(),
+                    "\u{2580}" | "\u{2584}"
+                )
+            })
+        })
+    }
+
+    #[test]
+    fn a_drawable_image_is_painted_into_the_rows_reserved_for_it() {
+        let (dir, blocks, images) = image_fixture("ui-image", "![Alt](red.png)");
+        let layout_doc = layout::layout(&blocks, 20, &images);
+        let (mut gallery, jobs) = crate::image::test_gallery();
+        let mut app = App::new(layout_doc.total_rows);
+        app.viewport_height = 5;
+
+        let mut terminal = Terminal::new(TestBackend::new(20, 5)).unwrap();
+        draw_until_settled(
+            &mut terminal,
+            &app,
+            &blocks,
+            &layout_doc,
+            &images,
+            &mut gallery,
+            &jobs,
+        );
+
+        // 40x40 px at a 10x20 cell is 4 cols by 2 rows of half-blocks.
+        assert_eq!(layout_doc.total_rows, 2);
+        assert!(
+            is_painted(terminal.backend().buffer(), 4, 2),
+            "the image's rows should carry the picture's colours"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_image_shows_its_placeholder_until_the_worker_answers() {
+        let (dir, blocks, images) = image_fixture("ui-image-pending", "![Alt](red.png)");
+        let layout_doc = layout::layout(&blocks, 20, &images);
+        let (mut gallery, jobs) = crate::image::test_gallery();
+        let mut app = App::new(layout_doc.total_rows);
+        app.viewport_height = 5;
+
+        let mut terminal = Terminal::new(TestBackend::new(20, 5)).unwrap();
+        // One frame, with the worker never getting a turn.
+        draw(
+            &mut terminal,
+            &app,
+            &blocks,
+            &layout_doc,
+            &images,
+            &mut gallery,
+        );
+
+        assert!(
+            row_text(terminal.backend().buffer(), 0, 20).contains("[Alt]"),
+            "got: {:?}",
+            row_text(terminal.backend().buffer(), 0, 20)
+        );
+        assert!(
+            !is_painted(terminal.backend().buffer(), 4, 2),
+            "nothing of the picture yet"
+        );
+
+        // And once it does answer, the picture replaces the placeholder.
+        draw_until_settled(
+            &mut terminal,
+            &app,
+            &blocks,
+            &layout_doc,
+            &images,
+            &mut gallery,
+            &jobs,
+        );
+        assert!(!row_text(terminal.backend().buffer(), 0, 20).contains("[Alt]"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn text_after_an_image_starts_below_the_rows_the_picture_reserved() {
+        let (dir, blocks, images) = image_fixture("ui-image-after", "![Alt](red.png)\n\nAfter it.");
+        let layout_doc = layout::layout(&blocks, 20, &images);
+        let (mut gallery, jobs) = crate::image::test_gallery();
+        let mut app = App::new(layout_doc.total_rows);
+        app.viewport_height = 5;
+
+        let mut terminal = Terminal::new(TestBackend::new(20, 5)).unwrap();
+        draw_until_settled(
+            &mut terminal,
+            &app,
+            &blocks,
+            &layout_doc,
+            &images,
+            &mut gallery,
+            &jobs,
+        );
 
         // The picture takes rows 0-1, so the paragraph belongs on row 2.
         let buffer = terminal.backend().buffer();
@@ -935,42 +1051,86 @@ mod tests {
     }
 
     #[test]
-    fn an_image_scrolled_half_off_screen_shows_its_placeholder_instead() {
-        use ratatui_image::picker::Picker;
-
+    fn an_image_scrolled_half_off_screen_goes_back_to_its_placeholder() {
         let (dir, blocks, images) =
             image_fixture("ui-image-partial", "Above.\n\n![Alt](red.png)\n\nAfter it.");
         let layout_doc = layout::layout(&blocks, 20, &images);
-        let mut gallery = Gallery::new(Some(Picker::halfblocks()));
+        let (mut gallery, jobs) = crate::image::test_gallery();
         let mut app = App::new(layout_doc.total_rows);
-        // A two-row viewport with the image's second row at the bottom:
-        // rows are "Above." 0, picture 1-2, "After it." 3.
+        // Rows are "Above." 0, picture 1-2, "After it." 3.
+        app.viewport_height = 4;
+
+        let mut terminal = Terminal::new(TestBackend::new(20, 4)).unwrap();
+        draw_until_settled(
+            &mut terminal,
+            &app,
+            &blocks,
+            &layout_doc,
+            &images,
+            &mut gallery,
+            &jobs,
+        );
+        assert!(
+            !row_text(terminal.backend().buffer(), 1, 20).contains("[Alt]"),
+            "the picture is on screen to begin with"
+        );
+
+        // Scroll until only the picture's second row is left on screen.
         app.viewport_height = 2;
         app.scroll = 2;
-
         let mut terminal = Terminal::new(TestBackend::new(20, 2)).unwrap();
-        terminal
-            .draw(|frame| {
-                render(
-                    frame,
-                    Screen {
-                        app: &app,
-                        blocks: &blocks,
-                        layout_doc: &layout_doc,
-                        toc: &[],
-                        matches: &[],
-                        image_sizing: &images,
-                    },
-                    &mut gallery,
-                )
-            })
-            .unwrap();
+        draw_until_settled(
+            &mut terminal,
+            &app,
+            &blocks,
+            &layout_doc,
+            &images,
+            &mut gallery,
+            &jobs,
+        );
 
-        let buffer = terminal.backend().buffer();
         assert!(
-            row_text(buffer, 0, 20).contains("[Alt]"),
+            row_text(terminal.backend().buffer(), 0, 20).contains("[Alt]"),
             "got: {:?}",
-            row_text(buffer, 0, 20)
+            row_text(terminal.backend().buffer(), 0, 20)
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_image_still_being_encoded_keeps_its_placeholder_rather_than_a_gap() {
+        let (dir, blocks, images) = image_fixture("ui-image-encoding", "![Alt](red.png)");
+        let layout_doc = layout::layout(&blocks, 20, &images);
+        let (mut gallery, jobs) = crate::image::test_gallery();
+        let mut app = App::new(layout_doc.total_rows);
+        app.viewport_height = 5;
+
+        let mut terminal = Terminal::new(TestBackend::new(20, 5)).unwrap();
+        // Frame one asks for the decode; the worker answers it, and only
+        // it — the re-encode that the next frame asks for is left pending.
+        draw(
+            &mut terminal,
+            &app,
+            &blocks,
+            &layout_doc,
+            &images,
+            &mut gallery,
+        );
+        work(&mut gallery, &jobs);
+        draw(
+            &mut terminal,
+            &app,
+            &blocks,
+            &layout_doc,
+            &images,
+            &mut gallery,
+        );
+
+        assert!(
+            row_text(terminal.backend().buffer(), 0, 20).contains("[Alt]"),
+            "got: {:?}",
+            row_text(terminal.backend().buffer(), 0, 20)
         );
 
         std::fs::remove_dir_all(&dir).ok();

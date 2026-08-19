@@ -31,7 +31,11 @@ fn main() -> anyhow::Result<()> {
     // The capability query writes to the terminal and reads the reply off
     // stdin, so it has to run inside the alternate screen but before the
     // input thread starts taking stdin for itself.
-    let gallery = Gallery::new(Some(image::detect_picker()));
+    let picker = image::detect_picker();
+    let gallery = Gallery::new(
+        picker.clone(),
+        image::spawn_worker(picker, sources.sender()),
+    );
     let sources = sources.start_input();
 
     let result = reload::load(&args.file, gallery.font_size())
@@ -76,12 +80,23 @@ fn run(
                 &mut gallery,
             )
         })?;
+        // Drawing is what discovers an image needs re-encoding for its
+        // area; the work itself goes to the image thread.
+        gallery.dispatch_resizes();
 
         let outcome = match sources.recv() {
             Ok(Event::Key(key)) => app.on_key(key, &toc_entries, &matches),
             // A change on disk asks for exactly the work `r` does.
             Ok(Event::FileChanged) => KeyOutcome::Reload,
             Ok(Event::Resize) => KeyOutcome::Continue,
+            Ok(Event::ImageReady { block_id, protocol }) => {
+                gallery.image_decoded(block_id, protocol.map(|protocol| *protocol));
+                KeyOutcome::Continue
+            }
+            Ok(Event::ImageResized { block_id, response }) => {
+                gallery.image_resized(block_id, *response);
+                KeyOutcome::Continue
+            }
             Err(_) => return Ok(()),
         };
 

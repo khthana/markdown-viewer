@@ -6,14 +6,16 @@ use std::time::Duration;
 use notify_debouncer_full::notify::RecommendedWatcher;
 use notify_debouncer_full::{Debouncer, RecommendedCache};
 use ratatui::crossterm::event::{self, KeyEvent, KeyEventKind};
+use ratatui_image::protocol::StatefulProtocol;
+use ratatui_image::thread::ResizeResponse;
 
+use crate::image::ImageId;
 use crate::watch;
 
 /// Unified event stream for the app's main loop.
 ///
 /// Later slices add variants here (background image-decode completions)
 /// without needing to rework the channel itself.
-#[derive(Debug, Clone)]
 pub enum Event {
     Key(KeyEvent),
     /// The terminal was resized; the app re-queries the current size on
@@ -21,6 +23,18 @@ pub enum Event {
     Resize,
     /// The watched file changed on disk (already debounced by `watch`).
     FileChanged,
+    /// The image worker finished decoding an image — or found it
+    /// undecodable, in which case `protocol` is `None` and the block
+    /// keeps its placeholder.
+    ImageReady {
+        block_id: ImageId,
+        protocol: Option<Box<StatefulProtocol>>,
+    },
+    /// The image worker finished re-encoding an image for a new area.
+    ImageResized {
+        block_id: ImageId,
+        response: Box<ResizeResponse>,
+    },
 }
 
 /// Creates the single channel every event source feeds into. Sources get
@@ -62,6 +76,11 @@ impl PendingSources {
             receiver,
             watcher,
         }
+    }
+
+    /// A handle for another source — the image worker — to answer on.
+    pub fn sender(&self) -> mpsc::Sender<Event> {
+        self.sender.clone()
     }
 
     /// Starts reading the keyboard, yielding the sources the main loop

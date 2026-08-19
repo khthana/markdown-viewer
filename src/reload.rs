@@ -446,7 +446,7 @@ Body.");
             &mut app,
             &layout_doc,
             WIDTH,
-            &mut Gallery::new(None),
+            &mut Gallery::disabled(),
         );
 
         assert_eq!(app.scroll, 4, "the heading moved down one row");
@@ -478,7 +478,7 @@ Body.");
             &mut app,
             &layout_doc,
             WIDTH,
-            &mut Gallery::new(None),
+            &mut Gallery::disabled(),
         );
 
         assert_eq!(app.scroll, 3);
@@ -531,7 +531,7 @@ Body.");
                 &mut self.app,
                 &self.layout,
                 WIDTH,
-                &mut Gallery::new(None),
+                &mut Gallery::disabled(),
             );
         }
     }

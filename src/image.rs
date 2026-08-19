@@ -1,10 +1,16 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
 
 use ratatui::layout::Size;
+use ratatui_image::FontSize;
 use ratatui_image::picker::{Picker, ProtocolType};
-use ratatui_image::protocol::Protocol;
-use ratatui_image::{FontSize, Resize};
+use ratatui_image::protocol::StatefulProtocol;
+use ratatui_image::thread::{ResizeRequest, ResizeResponse, ThreadProtocol};
+use ratatui_image::{Resize, ResizeEncodeRender};
+
+use crate::event::Event;
 
 /// The tallest an image is allowed to be. Without a cap, one large
 /// picture would fill several screens and bury the text around it.
@@ -127,6 +133,36 @@ impl Sizing {
     }
 }
 
+/// Reads and decodes an image into the terminal's own protocol, ready to
+/// be sized. This is the slow part — file I/O plus a full decode — and
+/// the reason it runs on a worker thread rather than in the render loop.
+///
+/// `None` for anything that won't open or won't decode: the caller shows
+/// the alt-text placeholder and doesn't ask again.
+pub fn decode_protocol(picker: &Picker, file: &Path) -> Option<StatefulProtocol> {
+    let image = ::image::ImageReader::open(file)
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .decode()
+        .ok()?;
+    Some(picker.new_resize_protocol(image))
+}
+
+/// The protocol named by `MDVIEW_PROTOCOL`, for trying a tier the
+/// terminal wasn't detected as supporting — or, more often, for checking
+/// that the fallback tiers still look right on a terminal that supports
+/// everything. An unrecognised value is ignored rather than fatal.
+fn parse_protocol_override(value: &str) -> Option<ProtocolType> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "halfblocks" | "halfblock" => Some(ProtocolType::Halfblocks),
+        "sixel" => Some(ProtocolType::Sixel),
+        "kitty" => Some(ProtocolType::Kitty),
+        "iterm2" => Some(ProtocolType::Iterm2),
+        _ => None,
+    }
+}
+
 /// Asks the terminal what it can draw and how big its cells are.
 ///
 /// Must run after entering the alternate screen but before any input is
@@ -135,77 +171,281 @@ impl Sizing {
 /// sensible default cell size, since half-blocks are just coloured
 /// characters that any 16-colour terminal can show.
 ///
-/// The result is clamped to half-blocks even where a real graphics
-/// protocol was detected: Sixel/Kitty/iTerm2 output is issue #11.
+/// `MDVIEW_PROTOCOL` overrides whatever was detected, for testing a tier
+/// on a terminal that would otherwise pick a different one.
 pub fn detect_picker() -> Picker {
     let mut picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
-    picker.set_protocol_type(ProtocolType::Halfblocks);
+    if let Some(forced) = std::env::var("MDVIEW_PROTOCOL")
+        .ok()
+        .as_deref()
+        .and_then(parse_protocol_override)
+    {
+        picker.set_protocol_type(forced);
+    }
     picker
 }
 
-/// The decoded, terminal-ready form of each image, kept between frames.
+/// How a picture is fitted to the rows reserved for it. Shared between
+/// the widget that renders it and the check for whether it's ready to be
+/// rendered, which have to agree or the check is meaningless.
+pub const IMAGE_RESIZE: Resize = Resize::Fit(None);
+
+/// Identifies one image block in one version of the document.
 ///
-/// Decoding and protocol-encoding an image is far too slow to redo on
-/// every keystroke, and the result depends on the area it was fitted to,
-/// so results are cached per (path, area). A failure is cached too — a
-/// corrupt file shouldn't be reopened sixty times a second just to fail
-/// again.
+/// The generation is what makes a reply from before a reload
+/// recognisably stale: block 3 of the old document is not block 3 of the
+/// new one, and a picture decoded for the old one must not be painted
+/// over the new.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ImageId {
+    generation: u64,
+    block: usize,
+}
+
+/// Work for the image thread. Both kinds are slow enough to be worth
+/// keeping out of the render loop: a decode reads and unpacks a file, a
+/// resize re-encodes the picture for a new area.
+pub enum Job {
+    Decode {
+        id: ImageId,
+        file: PathBuf,
+    },
+    /// Boxed because a resize request carries the whole decoded image,
+    /// which would otherwise make every queued job that size.
+    Resize {
+        id: ImageId,
+        request: Box<ResizeRequest>,
+    },
+}
+
+/// Runs the image thread, answering every job on `events`.
+pub fn spawn_worker(picker: Picker, events: Sender<Event>) -> Sender<Job> {
+    let (sender, jobs) = mpsc::channel::<Job>();
+    thread::spawn(move || {
+        for job in jobs {
+            let answer = match job {
+                Job::Decode { id, file } => Event::ImageReady {
+                    block_id: id,
+                    protocol: decode_protocol(&picker, &file).map(Box::new),
+                },
+                Job::Resize { id, request } => match request.resize_encode() {
+                    Ok(response) => Event::ImageResized {
+                        block_id: id,
+                        response: Box::new(response),
+                    },
+                    // An image that won't re-encode is as good as one that
+                    // wouldn't decode: back to the placeholder.
+                    Err(_) => Event::ImageReady {
+                        block_id: id,
+                        protocol: None,
+                    },
+                },
+            };
+            if events.send(answer).is_err() {
+                break;
+            }
+        }
+    });
+    sender
+}
+
+/// A gallery wired to a channel the caller reads from, standing in for
+/// the worker thread. Shared with `ui`'s tests, which play that part.
+#[cfg(test)]
+pub(crate) fn test_gallery() -> (Gallery, Receiver<Job>) {
+    let (sender, jobs) = mpsc::channel();
+    (Gallery::new(Picker::halfblocks(), sender), jobs)
+}
+
+/// What the render pass knows about one image.
+enum Slot {
+    /// Asked for; the worker hasn't answered yet.
+    Pending,
+    /// Decoded and drawable. `outbox` is where the protocol posts its own
+    /// resize requests during rendering, which [`Gallery::dispatch_resizes`]
+    /// forwards to the worker.
+    Ready {
+        protocol: Box<ThreadProtocol>,
+        outbox: Receiver<ResizeRequest>,
+    },
+    /// Won't decode. Never asked for again.
+    Failed,
+}
+
+/// Every image the reader has scrolled to, in whatever state the worker
+/// has got it to.
+///
+/// The render loop only ever *asks*; nothing here blocks on a decode.
+/// Until an answer arrives the caller draws the alt-text placeholder, so
+/// a document full of pictures opens as fast as one without.
 pub struct Gallery {
-    picker: Option<Picker>,
-    protocols: HashMap<String, (Size, Option<Protocol>)>,
+    backend: Backend,
+    generation: u64,
+    slots: HashMap<ImageId, Slot>,
+}
+
+/// A gallery either has both a picker and a worker to talk to, or it
+/// draws nothing at all. Keeping them in one enum means there's no state
+/// where one is present and the other isn't.
+enum Backend {
+    /// Only tests build one today; issue #12's `--no-images` is what
+    /// makes this reachable in production.
+    #[allow(dead_code)]
+    Disabled,
+    Live {
+        picker: Picker,
+        jobs: Sender<Job>,
+    },
 }
 
 impl Gallery {
-    /// A gallery drawing through `picker`, or — with `None` — one that
-    /// draws nothing, leaving every image as an alt-text placeholder.
-    pub fn new(picker: Option<Picker>) -> Self {
+    /// A gallery that draws nothing — the alt-text tier. Only tests need
+    /// it until issue #12 adds `--no-images`.
+    #[cfg(test)]
+    pub(crate) fn disabled() -> Self {
         Self {
-            picker,
-            protocols: HashMap::new(),
+            backend: Backend::Disabled,
+            generation: 0,
+            slots: HashMap::new(),
+        }
+    }
+
+    /// A gallery drawing through `picker`, with `jobs` going to the image
+    /// thread.
+    pub fn new(picker: Picker, jobs: Sender<Job>) -> Self {
+        Self {
+            backend: Backend::Live { picker, jobs },
+            generation: 0,
+            slots: HashMap::new(),
         }
     }
 
     /// The terminal font size the picker detected, if there is one.
     pub fn font_size(&self) -> Option<FontSize> {
-        self.picker.as_ref().map(|picker| picker.font_size())
-    }
-
-    /// The drawable form of `path` fitted to `area`, decoding it the
-    /// first time it's asked for.
-    ///
-    /// `None` means the caller should fall back to the alt-text
-    /// placeholder: no picker, a path that isn't a local file, or an
-    /// image that wouldn't decode.
-    pub fn protocol(&mut self, sizing: &Sizing, path: &str, area: Size) -> Option<&Protocol> {
-        // One entry per image, replaced when the pane changes shape, so a
-        // session of resizing can't pile up stale copies.
-        let stale = self
-            .protocols
-            .get(path)
-            .is_none_or(|(fitted, _)| *fitted != area);
-        if stale {
-            let protocol = self.decode(sizing, path, area);
-            self.protocols.insert(path.to_string(), (area, protocol));
+        match &self.backend {
+            Backend::Live { picker, .. } => Some(picker.font_size()),
+            Backend::Disabled => None,
         }
-        self.protocols.get(path)?.1.as_ref()
     }
 
-    /// Drops every decoded image. Called on reload: the file on disk may
-    /// be a different picture now, under the same path.
+    /// The identity of the image in top-level block `block`, as of the
+    /// document currently loaded.
+    pub fn id_for(&self, block: usize) -> ImageId {
+        ImageId {
+            generation: self.generation,
+            block,
+        }
+    }
+
+    /// Asks the worker for this image, unless it has been asked for
+    /// already — a request per frame would queue a decode per keystroke.
+    pub fn request(&mut self, id: ImageId, sizing: &Sizing, path: &str) {
+        if self.slots.contains_key(&id) {
+            return;
+        }
+        let Backend::Live { jobs, .. } = &self.backend else {
+            return;
+        };
+        let Some(file) = sizing.resolve(path) else {
+            self.slots.insert(id, Slot::Failed);
+            return;
+        };
+        if jobs.send(Job::Decode { id, file }).is_ok() {
+            self.slots.insert(id, Slot::Pending);
+        }
+    }
+
+    /// Whether this image will actually paint into `area` on the next
+    /// frame, as opposed to posting an encode job and leaving the rows
+    /// untouched.
+    ///
+    /// Rendering a protocol that still needs encoding draws nothing —
+    /// it hands the picture to the worker instead — so the caller has to
+    /// know the difference to keep a placeholder in those rows rather
+    /// than a hole.
+    pub fn paints_now(&self, id: ImageId, area: Size) -> bool {
+        match self.slots.get(&id) {
+            Some(Slot::Ready { protocol, .. }) => {
+                protocol.protocol_type().is_some()
+                    && protocol.needs_resize(&IMAGE_RESIZE, area).is_none()
+            }
+            _ => false,
+        }
+    }
+
+    /// The drawable state of an image, or `None` while it's still being
+    /// decoded, or if it never will be.
+    pub fn protocol_mut(&mut self, id: ImageId) -> Option<&mut ThreadProtocol> {
+        match self.slots.get_mut(&id) {
+            Some(Slot::Ready { protocol, .. }) => Some(protocol),
+            _ => None,
+        }
+    }
+
+    /// Takes the worker's answer to a decode. `None` means the file
+    /// wouldn't decode.
+    pub fn image_decoded(&mut self, id: ImageId, protocol: Option<StatefulProtocol>) {
+        if id.generation != self.generation {
+            return;
+        }
+        let slot = match protocol {
+            Some(protocol) => {
+                let (sender, outbox) = mpsc::channel();
+                Slot::Ready {
+                    protocol: Box::new(ThreadProtocol::new(sender, Some(protocol))),
+                    outbox,
+                }
+            }
+            None => Slot::Failed,
+        };
+        self.slots.insert(id, slot);
+    }
+
+    /// Takes the worker's answer to a resize.
+    pub fn image_resized(&mut self, id: ImageId, response: ResizeResponse) {
+        if id.generation != self.generation {
+            return;
+        }
+        if let Some(Slot::Ready { protocol, .. }) = self.slots.get_mut(&id) {
+            // Discards the answer if the protocol has since asked for a
+            // different size — the newer request is the one that counts.
+            protocol.update_resized_protocol(response);
+        }
+    }
+
+    /// Hands the worker every resize the last render asked for. Called
+    /// after drawing, since that's when the protocols post them.
+    pub fn dispatch_resizes(&mut self) {
+        let Backend::Live { jobs, .. } = &self.backend else {
+            return;
+        };
+        // A request carries the only copy of its decoded image — the
+        // protocol handed it over — so one that can't be delivered has
+        // lost the picture for good. Those slots fall back to the
+        // placeholder instead of staying blank forever.
+        let mut undeliverable = Vec::new();
+        for (id, slot) in &self.slots {
+            if let Slot::Ready { outbox, .. } = slot {
+                while let Ok(request) = outbox.try_recv() {
+                    let request = Box::new(request);
+                    if jobs.send(Job::Resize { id: *id, request }).is_err() {
+                        undeliverable.push(*id);
+                        break;
+                    }
+                }
+            }
+        }
+        for id in undeliverable {
+            self.slots.insert(id, Slot::Failed);
+        }
+    }
+
+    /// Drops every decoded image and moves to a new generation, so
+    /// answers still in flight for the old document are ignored. Called
+    /// on reload: the same path may be a different picture now.
     pub fn forget_all(&mut self) {
-        self.protocols.clear();
-    }
-
-    fn decode(&self, sizing: &Sizing, path: &str, area: Size) -> Option<Protocol> {
-        let picker = self.picker.as_ref()?;
-        let file = sizing.resolve(path)?;
-        let image = ::image::ImageReader::open(file)
-            .ok()?
-            .with_guessed_format()
-            .ok()?
-            .decode()
-            .ok()?;
-        picker.new_protocol(image, area, Resize::Fit(None)).ok()
+        self.generation = self.generation.wrapping_add(1);
+        self.slots.clear();
     }
 }
 
@@ -349,76 +589,156 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_real_image_decodes_into_something_drawable() {
-        let dir = scratch_dir("gallery");
-        write_png(&dir.join("square.png"), 200, 200);
-        let sizing = Sizing::measure(&dir, FONT, ["square.png"]);
-        let mut gallery = Gallery::new(Some(Picker::halfblocks()));
-
-        assert!(
-            gallery
-                .protocol(&sizing, "square.png", Size::new(20, 10))
-                .is_some()
-        );
-
-        std::fs::remove_dir_all(&dir).ok();
+    fn decoded(picker_file: &Path) -> StatefulProtocol {
+        decode_protocol(&Picker::halfblocks(), picker_file).expect("a decodable image")
     }
 
     #[test]
-    fn an_image_that_will_not_decode_is_not_drawable_and_does_not_panic() {
-        let dir = scratch_dir("gallery-broken");
-        std::fs::write(dir.join("broken.png"), b"this is not an image").unwrap();
-        let sizing = Sizing::measure(&dir, FONT, ["broken.png"]);
-        let mut gallery = Gallery::new(Some(Picker::halfblocks()));
+    fn an_image_is_asked_for_once_however_many_frames_go_by() {
+        let dir = scratch_dir("gallery-request");
+        write_png(&dir.join("square.png"), 200, 200);
+        let sizing = Sizing::measure(&dir, FONT, ["square.png"]);
+        let (mut gallery, jobs) = test_gallery();
+        let id = gallery.id_for(0);
 
-        for _ in 0..2 {
-            assert!(
-                gallery
-                    .protocol(&sizing, "broken.png", Size::new(20, 10))
-                    .is_none()
-            );
+        for _ in 0..3 {
+            gallery.request(id, &sizing, "square.png");
         }
 
+        assert!(matches!(jobs.try_recv(), Ok(Job::Decode { .. })));
+        assert!(jobs.try_recv().is_err(), "one decode, not one per frame");
+        assert!(
+            gallery.protocol_mut(id).is_none(),
+            "nothing to draw until the worker answers"
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn a_gallery_without_a_picker_draws_nothing() {
-        let dir = scratch_dir("gallery-no-picker");
+    fn a_decoded_image_becomes_drawable() {
+        let dir = scratch_dir("gallery-decoded");
         write_png(&dir.join("square.png"), 200, 200);
         let sizing = Sizing::measure(&dir, FONT, ["square.png"]);
-        let mut gallery = Gallery::new(None);
+        let (mut gallery, _jobs) = test_gallery();
+        let id = gallery.id_for(0);
+        gallery.request(id, &sizing, "square.png");
 
-        assert!(
-            gallery
-                .protocol(&sizing, "square.png", Size::new(20, 10))
-                .is_none()
-        );
+        gallery.image_decoded(id, Some(decoded(&dir.join("square.png"))));
+
+        assert!(gallery.protocol_mut(id).is_some());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_image_that_would_not_decode_is_never_asked_for_again() {
+        let dir = scratch_dir("gallery-failed");
+        std::fs::write(dir.join("broken.png"), b"this is not an image").unwrap();
+        let sizing = Sizing::measure(&dir, FONT, ["broken.png"]);
+        let (mut gallery, jobs) = test_gallery();
+        let id = gallery.id_for(0);
+
+        gallery.request(id, &sizing, "broken.png");
+        let _ = jobs.try_recv();
+        gallery.image_decoded(id, None);
+        gallery.request(id, &sizing, "broken.png");
+
+        assert!(jobs.try_recv().is_err(), "a failure isn't retried");
+        assert!(gallery.protocol_mut(id).is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_remote_reference_is_not_worth_a_job() {
+        let sizing = Sizing::measure(Path::new("."), FONT, ["https://example.com/logo.png"]);
+        let (mut gallery, jobs) = test_gallery();
+        let id = gallery.id_for(0);
+
+        gallery.request(id, &sizing, "https://example.com/logo.png");
+
+        assert!(jobs.try_recv().is_err());
+        assert!(gallery.protocol_mut(id).is_none());
+    }
+
+    #[test]
+    fn an_answer_from_before_a_reload_is_ignored() {
+        let dir = scratch_dir("gallery-stale");
+        write_png(&dir.join("square.png"), 200, 200);
+        let sizing = Sizing::measure(&dir, FONT, ["square.png"]);
+        let (mut gallery, _jobs) = test_gallery();
+        let old_id = gallery.id_for(0);
+        gallery.request(old_id, &sizing, "square.png");
+
+        gallery.forget_all();
+        gallery.image_decoded(old_id, Some(decoded(&dir.join("square.png"))));
+
+        let new_id = gallery.id_for(0);
+        assert_ne!(old_id, new_id, "the same block, a different document");
+        assert!(gallery.protocol_mut(old_id).is_none());
+        assert!(gallery.protocol_mut(new_id).is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_gallery_without_a_picker_asks_for_nothing() {
+        let dir = scratch_dir("gallery-disabled");
+        write_png(&dir.join("square.png"), 200, 200);
+        let sizing = Sizing::measure(&dir, FONT, ["square.png"]);
+        let mut gallery = Gallery::disabled();
+        let id = gallery.id_for(0);
+
+        gallery.request(id, &sizing, "square.png");
+
+        assert!(gallery.protocol_mut(id).is_none());
         assert!(gallery.font_size().is_none());
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn a_reload_forgets_what_was_decoded() {
-        let dir = scratch_dir("gallery-forget");
+    fn a_real_image_decodes_into_a_protocol_for_the_terminal() {
+        let dir = scratch_dir("decode");
         write_png(&dir.join("square.png"), 200, 200);
-        let sizing = Sizing::measure(&dir, FONT, ["square.png"]);
-        let mut gallery = Gallery::new(Some(Picker::halfblocks()));
-        gallery.protocol(&sizing, "square.png", Size::new(20, 10));
 
-        gallery.forget_all();
-
-        // The file is gone now, so a re-decode has to fail — proving the
-        // earlier decode wasn't served from the cache.
-        std::fs::remove_file(dir.join("square.png")).unwrap();
-        assert!(
-            gallery
-                .protocol(&sizing, "square.png", Size::new(20, 10))
-                .is_none()
-        );
+        assert!(decode_protocol(&Picker::halfblocks(), &dir.join("square.png")).is_some());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_file_that_is_not_an_image_decodes_to_nothing() {
+        let dir = scratch_dir("decode-broken");
+        std::fs::write(dir.join("broken.png"), b"this is not an image").unwrap();
+
+        assert!(decode_protocol(&Picker::halfblocks(), &dir.join("broken.png")).is_none());
+        assert!(decode_protocol(&Picker::halfblocks(), &dir.join("missing.png")).is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_protocol_override_accepts_every_tier_and_ignores_nonsense() {
+        assert_eq!(
+            parse_protocol_override("kitty"),
+            Some(ProtocolType::Kitty),
+            "kitty"
+        );
+        assert_eq!(
+            parse_protocol_override(" Sixel "),
+            Some(ProtocolType::Sixel)
+        );
+        assert_eq!(
+            parse_protocol_override("halfblocks"),
+            Some(ProtocolType::Halfblocks)
+        );
+        assert_eq!(
+            parse_protocol_override("iterm2"),
+            Some(ProtocolType::Iterm2)
+        );
+        assert_eq!(parse_protocol_override("wat"), None);
+        assert_eq!(parse_protocol_override(""), None);
     }
 }
