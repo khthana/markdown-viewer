@@ -43,7 +43,7 @@ mod tests {
     fn resolves_headings_to_their_laid_out_rows() {
         let source = "# Title\n\nIntro paragraph text.\n\n## Section";
         let (blocks, headings) = lower_with_headings(source);
-        let layout_doc = layout::layout(&blocks, 80);
+        let layout_doc = layout::layout(&blocks, 80, &crate::image::Sizing::text_only());
 
         let entries = resolve(&headings, &layout_doc);
 

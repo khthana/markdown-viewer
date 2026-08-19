@@ -1,6 +1,7 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use crate::image::Sizing;
 use crate::markdown::blocks::{self, Block, ColumnAlignment, Inline, flatten_plain_text};
 use crate::theme;
 
@@ -30,14 +31,14 @@ pub struct LayoutDoc {
 /// counting algorithm — otherwise the two are guaranteed to drift (e.g. a
 /// heading's rule line getting counted for rendering but not for
 /// scrolling).
-pub fn layout(blocks: &[Block], width: usize) -> LayoutDoc {
+pub fn layout(blocks: &[Block], width: usize, images: &Sizing) -> LayoutDoc {
     let mut laid_out = Vec::with_capacity(blocks.len());
     let mut rows = Vec::new();
     let mut row_start = 0;
 
     for (block_index, block) in blocks.iter().enumerate() {
         let mut scratch = Vec::new();
-        render_block(block, width, &mut scratch);
+        render_block(block, width, images, &mut scratch);
         let row_count = scratch.len();
         rows.extend(scratch.iter().map(line_plain_text));
         laid_out.push(LaidOutBlock {
@@ -55,12 +56,6 @@ pub fn layout(blocks: &[Block], width: usize) -> LayoutDoc {
     }
 }
 
-/// An image's stand-in text: a frame glyph plus whatever the image is
-/// called (see `blocks::image_label`).
-fn image_placeholder(alt: &str, path: &str) -> String {
-    format!("\u{1f5bc} [{}]", blocks::image_label(alt, path))
-}
-
 /// Concatenates a line's spans down to their plain text, discarding style.
 fn line_plain_text(line: &Line<'static>) -> String {
     line.spans.iter().map(|s| s.content.as_ref()).collect()
@@ -71,15 +66,15 @@ fn line_plain_text(line: &Line<'static>) -> String {
 /// on-screen rendering (`ui::render`) and row-count bookkeeping
 /// (`layout`), so the two can never disagree about how many rows a
 /// document occupies.
-pub fn render_lines(blocks: &[Block], width: usize) -> Vec<Line<'static>> {
+pub fn render_lines(blocks: &[Block], width: usize, images: &Sizing) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for block in blocks {
-        render_block(block, width, &mut lines);
+        render_block(block, width, images, &mut lines);
     }
     lines
 }
 
-fn render_block(block: &Block, width: usize, out: &mut Vec<Line<'static>>) {
+fn render_block(block: &Block, width: usize, images: &Sizing, out: &mut Vec<Line<'static>>) {
     match block {
         Block::Heading { level, text } => {
             let hs = theme::heading_style(*level);
@@ -107,13 +102,21 @@ fn render_block(block: &Block, width: usize, out: &mut Vec<Line<'static>>) {
             }
         }
         Block::Image { alt, path } => {
-            // Exactly one row, at any width: the reserved height is fixed
-            // in this tier, and a placeholder that wrapped would make the
-            // document's height depend on the terminal's width.
-            out.push(Line::from(Span::styled(
-                image_placeholder(alt, path),
-                theme::image_placeholder_style(),
-            )));
+            if images.draws(path) {
+                // Blank rows held open for `ui` to paint the picture into.
+                // The text has to leave them genuinely empty: whatever is
+                // written here would show through the image's own cells.
+                for _ in 0..images.rows_for_path(path, width) {
+                    out.push(Line::default());
+                }
+            } else {
+                // One row, at any width: a placeholder that wrapped would
+                // make the document's height depend on the terminal's.
+                out.push(Line::from(Span::styled(
+                    blocks::image_placeholder(alt, path),
+                    theme::image_placeholder_style(),
+                )));
+            }
         }
         Block::HorizontalRule => {
             out.push(Line::from(Span::raw("─".repeat(width.max(1)))));
@@ -129,7 +132,7 @@ fn render_block(block: &Block, width: usize, out: &mut Vec<Line<'static>>) {
                 .add_modifier(Modifier::ITALIC);
             let mut inner_lines = Vec::new();
             for b in inner {
-                render_block(b, width, &mut inner_lines);
+                render_block(b, width, images, &mut inner_lines);
             }
             for line in inner_lines {
                 let mut spans = vec![Span::styled("\u{2502} ", quote_style)];
@@ -155,14 +158,14 @@ fn render_block(block: &Block, width: usize, out: &mut Vec<Line<'static>>) {
                         (glyph, item.as_slice())
                     }
                 };
-                render_list_item(&bullet, content, width, out);
+                render_list_item(&bullet, content, width, images, out);
             }
         }
         Block::TaskListItem { checked, content } => {
-            render_list_item(&task_glyph(*checked), content, width, out);
+            render_list_item(&task_glyph(*checked), content, width, images, out);
         }
         Block::FootnoteDefinition { label, content } => {
-            render_list_item(&format!("[^{label}]: "), content, width, out);
+            render_list_item(&format!("[^{label}]: "), content, width, images, out);
         }
         Block::Table {
             alignments,
@@ -274,13 +277,19 @@ fn task_glyph(checked: bool) -> String {
 
 /// Renders a list item's blocks with `bullet` prefixed on the first line
 /// and blank padding aligning continuation lines under it.
-fn render_list_item(bullet: &str, content: &[Block], width: usize, out: &mut Vec<Line<'static>>) {
+fn render_list_item(
+    bullet: &str,
+    content: &[Block],
+    width: usize,
+    images: &Sizing,
+    out: &mut Vec<Line<'static>>,
+) {
     let bullet_width = bullet.chars().count();
     // Uses the full width (not narrowed for the bullet) so the bullet
     // doesn't shift wrap points relative to row counts.
     let mut item_lines = Vec::new();
     for b in content {
-        render_block(b, width, &mut item_lines);
+        render_block(b, width, images, &mut item_lines);
     }
     for (j, line) in item_lines.into_iter().enumerate() {
         let prefix = if j == 0 {
@@ -328,7 +337,7 @@ fn collect_words(inlines: &[Inline], style: Style, out: &mut Vec<(String, Style)
             // from the label it belongs to.
             Inline::Image { alt, path } => {
                 out.push((
-                    image_placeholder(alt, path),
+                    blocks::image_placeholder(alt, path),
                     theme::image_placeholder_style(),
                 ));
             }
@@ -367,6 +376,11 @@ fn wrap_words(words: &[(String, Style)], width: usize) -> Vec<Vec<Span<'static>>
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Layout for a terminal that can't draw images, which is what every
+    /// test that isn't about images wants.
+    fn text_layout(blocks: &[Block], width: usize) -> LayoutDoc {
+        layout(blocks, width, &Sizing::text_only())
+    }
 
     fn text_paragraph(s: &str) -> Block {
         Block::Paragraph(vec![Inline::Text(s.to_string())])
@@ -376,11 +390,11 @@ mod tests {
     fn single_paragraph_wraps_to_more_rows_at_a_narrower_width() {
         let blocks = vec![text_paragraph("the quick brown fox")];
 
-        let wide = layout(&blocks, 80);
+        let wide = text_layout(&blocks, 80);
         assert_eq!(wide.blocks[0].row_count, 1);
         assert_eq!(wide.total_rows, 1);
 
-        let narrow = layout(&blocks, 10);
+        let narrow = text_layout(&blocks, 10);
         assert_eq!(narrow.blocks[0].row_count, 2);
         assert_eq!(narrow.total_rows, 2);
     }
@@ -394,8 +408,8 @@ mod tests {
             text: vec![Inline::Text("A rather long heading title here".to_string())],
         }];
 
-        assert_eq!(layout(&blocks, 80).blocks[0].row_count, 1);
-        assert_eq!(layout(&blocks, 10).blocks[0].row_count, 4);
+        assert_eq!(text_layout(&blocks, 80).blocks[0].row_count, 1);
+        assert_eq!(text_layout(&blocks, 10).blocks[0].row_count, 4);
     }
 
     #[test]
@@ -407,14 +421,14 @@ mod tests {
             text: vec![Inline::Text("Title".to_string())],
         }];
 
-        assert_eq!(layout(&blocks, 80).blocks[0].row_count, 2);
+        assert_eq!(text_layout(&blocks, 80).blocks[0].row_count, 2);
     }
 
     #[test]
     fn horizontal_rule_takes_exactly_one_row() {
         let blocks = vec![Block::HorizontalRule];
-        assert_eq!(layout(&blocks, 80).blocks[0].row_count, 1);
-        assert_eq!(layout(&blocks, 10).blocks[0].row_count, 1);
+        assert_eq!(text_layout(&blocks, 80).blocks[0].row_count, 1);
+        assert_eq!(text_layout(&blocks, 10).blocks[0].row_count, 1);
     }
 
     #[test]
@@ -424,9 +438,9 @@ mod tests {
             text: "line one\nline two\nline three\n".to_string(),
         }];
         // Trailing newline doesn't create a phantom 4th row.
-        assert_eq!(layout(&blocks, 80).blocks[0].row_count, 3);
+        assert_eq!(text_layout(&blocks, 80).blocks[0].row_count, 3);
         // Code doesn't reflow with viewport width.
-        assert_eq!(layout(&blocks, 4).blocks[0].row_count, 3);
+        assert_eq!(text_layout(&blocks, 4).blocks[0].row_count, 3);
     }
 
     #[test]
@@ -435,7 +449,7 @@ mod tests {
             text_paragraph("first"),
             text_paragraph("second"),
         ])];
-        assert_eq!(layout(&blocks, 80).blocks[0].row_count, 2);
+        assert_eq!(text_layout(&blocks, 80).blocks[0].row_count, 2);
     }
 
     #[test]
@@ -454,20 +468,20 @@ mod tests {
             ],
         }];
         // item "one": 1 row; item "two": 1 row + 1 nested-list row = 2 rows.
-        assert_eq!(layout(&blocks, 80).blocks[0].row_count, 3);
+        assert_eq!(text_layout(&blocks, 80).blocks[0].row_count, 3);
     }
 
     #[test]
     fn layout_rows_expose_each_rendered_rows_plain_text_for_search() {
         let blocks = vec![text_paragraph("hello world")];
-        let doc = layout(&blocks, 80);
+        let doc = text_layout(&blocks, 80);
         assert_eq!(doc.rows, vec!["hello world".to_string()]);
     }
 
     #[test]
     fn multiple_paragraphs_get_sequential_row_ranges() {
         let blocks = vec![text_paragraph("first"), text_paragraph("second")];
-        let doc = layout(&blocks, 80);
+        let doc = text_layout(&blocks, 80);
 
         assert_eq!(
             doc.blocks,
@@ -493,6 +507,7 @@ mod tests {
         // must equal render_lines(...).len() for every block type,
         // including headings with rules, or scrolling breaks.
         let blocks = vec![
+            image("A picture", "square.png"),
             Block::Heading {
                 level: 1,
                 text: vec![Inline::Text("Title".to_string())],
@@ -508,12 +523,20 @@ mod tests {
             },
         ];
 
-        for width in [10, 20, 80] {
-            assert_eq!(
-                layout(&blocks, width).total_rows,
-                render_lines(&blocks, width).len(),
-                "mismatch at width {width}"
-            );
+        // Both tiers: a drawable image reserves several rows where the
+        // placeholder takes one, and the two passes must still agree.
+        let drawable = Sizing::with_pixels(
+            ratatui_image::FontSize::new(10, 20),
+            [("square.png", (200, 200))],
+        );
+        for images in [Sizing::text_only(), drawable] {
+            for width in [10, 20, 80] {
+                assert_eq!(
+                    layout(&blocks, width, &images).total_rows,
+                    render_lines(&blocks, width, &images).len(),
+                    "mismatch at width {width}"
+                );
+            }
         }
     }
 
@@ -533,7 +556,7 @@ mod tests {
         ];
 
         for width in [80, 20] {
-            let doc = layout(&blocks, width);
+            let doc = text_layout(&blocks, width);
             assert_eq!(doc.blocks[1].row_count, 1, "at width {width}");
             assert_eq!(doc.blocks[2].row_start, 2, "at width {width}");
         }
@@ -541,22 +564,53 @@ mod tests {
 
     #[test]
     fn an_images_reserved_row_holds_its_placeholder_text() {
-        let doc = layout(&[image("A diagram", "diagram.png")], 80);
+        let doc = text_layout(&[image("A diagram", "diagram.png")], 80);
 
         assert_eq!(doc.rows, vec!["\u{1f5bc} [A diagram]".to_string()]);
     }
 
     #[test]
     fn an_image_without_alt_text_falls_back_to_its_file_name() {
-        let doc = layout(&[image("", "photos/holiday.jpg")], 80);
+        let doc = text_layout(&[image("", "photos/holiday.jpg")], 80);
 
         assert_eq!(doc.rows, vec!["\u{1f5bc} [holiday.jpg]".to_string()]);
     }
 
     #[test]
     fn an_image_with_no_alt_text_and_no_file_name_still_gets_a_label() {
-        let doc = layout(&[image("", "")], 80);
+        let doc = text_layout(&[image("", "")], 80);
 
         assert_eq!(doc.rows, vec!["\u{1f5bc} [image]".to_string()]);
+    }
+
+    #[test]
+    fn a_drawable_image_reserves_blank_rows_for_the_picture_itself() {
+        // 200x200 px at a 10x20 cell is 20 cols by 10 rows.
+        let sizing = Sizing::with_pixels(
+            ratatui_image::FontSize::new(10, 20),
+            [("square.png", (200, 200))],
+        );
+
+        let doc = layout(&[image("Alt", "square.png")], 80, &sizing);
+
+        assert_eq!(doc.blocks[0].row_count, 10);
+        assert_eq!(
+            doc.rows,
+            vec![String::new(); 10],
+            "the rows are left empty for the picture to be painted into"
+        );
+    }
+
+    #[test]
+    fn an_image_the_terminal_cannot_draw_keeps_its_placeholder_row() {
+        let sizing = Sizing::with_pixels(
+            ratatui_image::FontSize::new(10, 20),
+            [("elsewhere.png", (200, 200))],
+        );
+
+        let doc = layout(&[image("Alt", "square.png")], 80, &sizing);
+
+        assert_eq!(doc.blocks[0].row_count, 1);
+        assert_eq!(doc.rows, vec!["\u{1f5bc} [Alt]".to_string()]);
     }
 }

@@ -29,6 +29,52 @@ pub fn channel() -> (mpsc::Sender<Event>, mpsc::Receiver<Event>) {
     mpsc::channel()
 }
 
+/// A file watcher running on a channel nobody reads from yet.
+///
+/// The two halves are separate types so the startup order can't be got
+/// wrong: the watcher has to start before the alternate screen (its
+/// failure warning must reach the real terminal), while the keyboard
+/// reader has to start *after* anything that queries the terminal and
+/// waits for a reply on stdin — image capability detection — or it will
+/// swallow the reply. Only [`Sources`] can be read from, and the only way
+/// to get one is to start the input thread.
+pub struct PendingSources {
+    sender: mpsc::Sender<Event>,
+    receiver: mpsc::Receiver<Event>,
+    watcher: Option<Debouncer<RecommendedWatcher, RecommendedCache>>,
+}
+
+impl PendingSources {
+    /// Starts watching `path`. A watcher that can't start is reported on
+    /// stderr and the viewer runs without auto-reload — manual `r` still
+    /// works.
+    pub fn watching(path: &Path) -> Self {
+        let (sender, receiver) = channel();
+        let watcher = match watch::spawn(path, sender.clone()) {
+            Ok(watcher) => Some(watcher),
+            Err(error) => {
+                eprintln!("mdview: auto-reload unavailable: {error:#}");
+                None
+            }
+        };
+        Self {
+            sender,
+            receiver,
+            watcher,
+        }
+    }
+
+    /// Starts reading the keyboard, yielding the sources the main loop
+    /// consumes.
+    pub fn start_input(self) -> Sources {
+        spawn_crossterm_source(self.sender);
+        Sources {
+            receiver: self.receiver,
+            _watcher: self.watcher,
+        }
+    }
+}
+
 /// Every event source the main loop reads from, kept alive as one value:
 /// dropping the file watcher stops auto-reload, so it lives here for as
 /// long as the receiver does.
@@ -42,28 +88,6 @@ impl Sources {
     /// sender is gone, which the main loop treats as "quit".
     pub fn recv(&self) -> Result<Event, mpsc::RecvError> {
         self.receiver.recv()
-    }
-}
-
-/// Starts the input thread and the file watcher on the shared channel.
-///
-/// Call this *before* entering the alternate screen: a watcher that can't
-/// start is reported on stderr and the viewer runs without auto-reload
-/// (manual `r` still works), and that warning has to land somewhere the
-/// user can actually see it.
-pub fn spawn_sources(path: &Path) -> Sources {
-    let (sender, receiver) = channel();
-    let watcher = match watch::spawn(path, sender.clone()) {
-        Ok(watcher) => Some(watcher),
-        Err(error) => {
-            eprintln!("mdview: auto-reload unavailable: {error:#}");
-            None
-        }
-    };
-    spawn_crossterm_source(sender);
-    Sources {
-        receiver,
-        _watcher: watcher,
     }
 }
 

@@ -344,6 +344,29 @@ pub fn image_label(alt: &str, path: &str) -> String {
     }
 }
 
+/// Every path a *drawable* image points at, in document order.
+///
+/// Only top-level images count. An image inside a blockquote or a list
+/// item is rendered with the container's own prefix (`\u{2502} `, a
+/// bullet) down the left of every row, and the picture pass paints whole
+/// rectangles — so those keep their alt-text placeholder, as do inline
+/// images in a heading, link, or table cell, which never get rows at all.
+pub fn image_paths(blocks: &[Block]) -> Vec<String> {
+    blocks
+        .iter()
+        .filter_map(|block| match block {
+            Block::Image { path, .. } => Some(path.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The stand-in shown in place of an image: a frame glyph plus whatever
+/// the image is called.
+pub fn image_placeholder(alt: &str, path: &str) -> String {
+    format!("\u{1f5bc} [{}]", image_label(alt, path))
+}
+
 /// Flattens inline spans down to their plain text content, e.g. for TOC
 /// entry labels where inline styling doesn't apply.
 pub fn flatten_plain_text(inlines: &[Inline]) -> String {
@@ -804,6 +827,25 @@ mod tests {
                 alt: "x".to_string(),
                 path: "y.png".to_string(),
             }])])]
+        );
+    }
+
+    #[test]
+    fn image_paths_only_finds_images_that_can_be_drawn() {
+        let blocks = lower(
+            "![one](a.png)
+
+> ![two](b.png)
+
+- ![three](c.png)
+
+# Heading ![inline](d.png)",
+        );
+
+        assert_eq!(
+            image_paths(&blocks),
+            vec!["a.png".to_string()],
+            "only a top-level image gets rows a picture can be painted into"
         );
     }
 }

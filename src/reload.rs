@@ -1,8 +1,10 @@
 use std::path::Path;
 
 use anyhow::Context;
+use ratatui_image::FontSize;
 
 use crate::app::{self, App};
+use crate::image::{Gallery, Sizing};
 use crate::markdown::blocks::{self, Block, HeadingRef};
 use crate::markdown::layout::{self, LayoutDoc};
 use crate::search;
@@ -31,19 +33,37 @@ pub enum AnchorKind {
     Unanchored,
 }
 
-/// A parsed Markdown file: its blocks plus the headings collected from
-/// them. A reload replaces one of these wholesale.
+/// A parsed Markdown file: its blocks, the headings collected from them,
+/// and the measurements of the images it references. A reload replaces
+/// one of these wholesale.
 pub struct Document {
     pub blocks: Vec<Block>,
     pub headings: Vec<HeadingRef>,
+    pub image_sizing: Sizing,
 }
 
-/// Reads and parses the file at `path`.
-pub fn load(path: &Path) -> anyhow::Result<Document> {
+/// Reads and parses the file at `path`, measuring its images against
+/// `font` — the terminal's cell size, or `None` on a terminal that can't
+/// draw them, where every image stays an alt-text placeholder.
+pub fn load(path: &Path, font: Option<FontSize>) -> anyhow::Result<Document> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("could not read file: {}", path.display()))?;
     let (blocks, headings) = blocks::lower_with_headings(&content);
-    Ok(Document { blocks, headings })
+    let images = match font {
+        // Image paths are written relative to the document, not to
+        // wherever the viewer happens to be run from.
+        Some(font) => Sizing::measure(
+            path.parent().unwrap_or(Path::new(".")),
+            font,
+            blocks::image_paths(&blocks),
+        ),
+        None => Sizing::text_only(),
+    };
+    Ok(Document {
+        blocks,
+        headings,
+        image_sizing: images,
+    })
 }
 
 /// Re-reads the file and swaps in the new document, moving `app`'s scroll
@@ -60,12 +80,18 @@ pub fn reload_preserving_position(
     app: &mut App,
     layout_doc: &LayoutDoc,
     width: usize,
+    gallery: &mut Gallery,
 ) {
     let anchor = compute_anchor(&document.headings, layout_doc, app.scroll);
     let match_anchor = search::anchor_match(&app.search_query, layout_doc, app.current_match);
-    let Ok(fresh) = load(path) else { return };
+    let Ok(fresh) = load(path, gallery.font_size()) else {
+        return;
+    };
+    // Whatever was decoded belongs to the old file; the same path may be
+    // a different picture now.
+    gallery.forget_all();
 
-    let new_layout = layout::layout(&fresh.blocks, width);
+    let new_layout = layout::layout(&fresh.blocks, width, &fresh.image_sizing);
     app.total_rows = new_layout.total_rows;
     app.scroll = resolve_anchor(&anchor, &fresh.headings, &new_layout, app.viewport_height);
     // The scroll position stays where the document anchor put it: the
@@ -193,7 +219,7 @@ mod tests {
 
     fn doc(source: &str) -> Doc {
         let (blocks, headings) = lower_with_headings(source);
-        let layout = layout::layout(&blocks, WIDTH);
+        let layout = layout::layout(&blocks, WIDTH, &crate::image::Sizing::text_only());
         Doc { headings, layout }
     }
 
@@ -402,8 +428,9 @@ Body.");
         let path = dir.join("notes.md");
         std::fs::write(&path, "# Title\n\nIntro.\n\n## Section\n\nBody text.").unwrap();
 
-        let mut document = load(&path).unwrap();
-        let layout_doc = layout::layout(&document.blocks, WIDTH);
+        let mut document = load(&path, None).unwrap();
+        let layout_doc =
+            layout::layout(&document.blocks, WIDTH, &crate::image::Sizing::text_only());
         let mut app = App::new(layout_doc.total_rows);
         app.viewport_height = VIEWPORT;
         app.scroll = 3; // the row "## Section" starts on
@@ -413,7 +440,14 @@ Body.");
             "# Title\n\nIntro.\n\nExtra.\n\n## Section\n\nBody text.",
         )
         .unwrap();
-        reload_preserving_position(&path, &mut document, &mut app, &layout_doc, WIDTH);
+        reload_preserving_position(
+            &path,
+            &mut document,
+            &mut app,
+            &layout_doc,
+            WIDTH,
+            &mut Gallery::new(None),
+        );
 
         assert_eq!(app.scroll, 4, "the heading moved down one row");
         assert_eq!(app.total_rows, 7, "the new document's rows are in effect");
@@ -428,8 +462,9 @@ Body.");
         let path = dir.join("notes.md");
         std::fs::write(&path, "# Title\n\nIntro.\n\n## Section\n\nBody text.").unwrap();
 
-        let mut document = load(&path).unwrap();
-        let layout_doc = layout::layout(&document.blocks, WIDTH);
+        let mut document = load(&path, None).unwrap();
+        let layout_doc =
+            layout::layout(&document.blocks, WIDTH, &crate::image::Sizing::text_only());
         let mut app = App::new(layout_doc.total_rows);
         app.viewport_height = VIEWPORT;
         app.scroll = 3;
@@ -437,7 +472,14 @@ Body.");
 
         // Mid-save, an editor can leave the path momentarily missing.
         std::fs::remove_file(&path).unwrap();
-        reload_preserving_position(&path, &mut document, &mut app, &layout_doc, WIDTH);
+        reload_preserving_position(
+            &path,
+            &mut document,
+            &mut app,
+            &layout_doc,
+            WIDTH,
+            &mut Gallery::new(None),
+        );
 
         assert_eq!(app.scroll, 3);
         assert_eq!(app.total_rows, layout_doc.total_rows);
@@ -462,8 +504,9 @@ Body.");
             let path = dir.join("notes.md");
             std::fs::write(&path, source).unwrap();
 
-            let document = load(&path).unwrap();
-            let layout = layout::layout(&document.blocks, WIDTH);
+            let document = load(&path, None).unwrap();
+            let layout =
+                layout::layout(&document.blocks, WIDTH, &crate::image::Sizing::text_only());
             let mut app = App::new(layout.total_rows);
             app.viewport_height = VIEWPORT;
             app.search_query = query.to_string();
@@ -488,6 +531,7 @@ Body.");
                 &mut self.app,
                 &self.layout,
                 WIDTH,
+                &mut Gallery::new(None),
             );
         }
     }

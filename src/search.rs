@@ -166,7 +166,7 @@ mod tests {
 
     fn layout_doc_for(source: &str) -> layout::LayoutDoc {
         let blocks = lower(source);
-        layout::layout(&blocks, 80)
+        layout::layout(&blocks, 80, &crate::image::Sizing::text_only())
     }
 
     #[test]

@@ -1,15 +1,30 @@
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Rect, Size};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block as RatBlock, Borders, List, ListItem, Paragraph};
+use ratatui_image::Image as RatatuiImage;
 
 use crate::app::{App, Mode};
-use crate::markdown::blocks::Block;
-use crate::markdown::layout;
+use crate::image::{Gallery, Sizing};
+use crate::markdown::blocks::{self, Block};
+use crate::markdown::layout::{self, LayoutDoc};
 use crate::search;
 use crate::theme;
 use crate::toc::TocEntry;
+
+/// Everything one frame draws: the pager state plus the document it's
+/// looking at, already parsed, laid out, and resolved. Bundled because
+/// these six always travel together and are always built from the same
+/// width.
+pub struct Screen<'a> {
+    pub app: &'a App,
+    pub blocks: &'a [Block],
+    pub layout_doc: &'a LayoutDoc,
+    pub toc: &'a [TocEntry],
+    pub matches: &'a [search::Match],
+    pub image_sizing: &'a Sizing,
+}
 
 /// Splits a frame's area into an optional TOC sidebar and the main
 /// content pane. Used by both `main.rs` (to lay out the document at the
@@ -106,18 +121,20 @@ fn highlight_line(line: Line<'static>, start: usize, end: usize, style: Style) -
 /// should use `split_areas` on the same `area` for that layout pass too.
 /// `matches` is only painted onto the text when `app.search_active`, and
 /// must have been resolved against that same `LayoutDoc`.
-pub fn render(
-    frame: &mut Frame,
-    app: &App,
-    blocks: &[Block],
-    toc: &[TocEntry],
-    matches: &[search::Match],
-) {
+pub fn render(frame: &mut Frame, screen: Screen<'_>, gallery: &mut Gallery) {
+    let Screen {
+        app,
+        blocks,
+        layout_doc,
+        toc,
+        matches,
+        image_sizing,
+    } = screen;
     let area = frame.area();
     let (sidebar_area, main_area) = split_areas(area, app.toc_open);
     let (content_area, status_area) = split_status(main_area, search_status_visible(app));
 
-    let mut lines = layout::render_lines(blocks, main_area.width as usize);
+    let mut lines = layout::render_lines(blocks, main_area.width as usize, image_sizing);
     if app.search_active {
         for (i, m) in matches.iter().enumerate() {
             if let Some(line) = lines.get_mut(m.row) {
@@ -139,6 +156,75 @@ pub fn render(
 
     if let Some(sidebar_area) = sidebar_area {
         render_toc(frame, sidebar_area, toc, app.toc_selected, app.toc_focused);
+    }
+
+    render_images(
+        frame,
+        content_area,
+        app,
+        blocks,
+        layout_doc,
+        image_sizing,
+        gallery,
+    );
+}
+
+/// Fills the rows `layout` reserved for each image: with the picture
+/// itself when the whole of it is on screen, and with its alt-text label
+/// otherwise.
+///
+/// An image that's only partly scrolled into view is not cropped —
+/// re-fitting a picture on every scroll tick would cost a decode per
+/// keystroke — but it can't be left blank either, so the reader sees the
+/// same placeholder the untouchable tiers show.
+fn render_images(
+    frame: &mut Frame,
+    content_area: Rect,
+    app: &App,
+    blocks: &[Block],
+    layout_doc: &LayoutDoc,
+    images: &Sizing,
+    gallery: &mut Gallery,
+) {
+    let viewport = app.scroll..app.scroll + content_area.height as usize;
+
+    for laid_out in &layout_doc.blocks {
+        let Some(Block::Image { alt, path }) = blocks.get(laid_out.block_index) else {
+            continue;
+        };
+        if !images.draws(path) {
+            continue;
+        }
+        let last_row = laid_out.row_start + laid_out.row_count;
+        if last_row <= viewport.start || laid_out.row_start >= viewport.end {
+            continue;
+        }
+
+        let fully_visible = laid_out.row_start >= viewport.start && last_row <= viewport.end;
+        let top = laid_out.row_start.max(viewport.start);
+        let area = Rect {
+            x: content_area.x,
+            y: content_area.y + (top - viewport.start) as u16,
+            width: images.cols_for_path(path, content_area.width as usize) as u16,
+            height: (last_row.min(viewport.end) - top) as u16,
+        };
+
+        let protocol = fully_visible
+            .then(|| gallery.protocol(images, path, Size::new(area.width, area.height)))
+            .flatten();
+        match protocol {
+            Some(protocol) => frame.render_widget(RatatuiImage::new(protocol), area),
+            None => frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    blocks::image_placeholder(alt, path),
+                    theme::image_placeholder_style(),
+                ))),
+                Rect {
+                    width: content_area.width,
+                    ..area
+                },
+            ),
+        }
     }
 }
 
@@ -205,6 +291,33 @@ mod tests {
     use ratatui::style::{Color, Modifier};
 
     use super::*;
+
+    /// Draws with the text-only image tier and a fresh layout at the
+    /// frame's own width, which is what every test that isn't about
+    /// images wants.
+    fn text_render(
+        frame: &mut Frame,
+        app: &App,
+        blocks: &[Block],
+        toc: &[TocEntry],
+        matches: &[search::Match],
+    ) {
+        let images = Sizing::text_only();
+        let (_, main_area) = split_areas(frame.area(), app.toc_open);
+        let layout_doc = layout::layout(blocks, main_area.width as usize, &images);
+        render(
+            frame,
+            Screen {
+                app,
+                blocks,
+                layout_doc: &layout_doc,
+                toc,
+                matches,
+                image_sizing: &images,
+            },
+            &mut Gallery::new(None),
+        );
+    }
     use crate::markdown::blocks::Inline;
 
     #[test]
@@ -245,7 +358,7 @@ mod tests {
         let backend = TestBackend::new(20, 3);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render(frame, &app, &blocks, &[], &[]))
+            .draw(|frame| text_render(frame, &app, &blocks, &[], &[]))
             .unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -265,7 +378,7 @@ mod tests {
         let backend = TestBackend::new(20, 3);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render(frame, &app, &blocks, &[], &[]))
+            .draw(|frame| text_render(frame, &app, &blocks, &[], &[]))
             .unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -331,7 +444,7 @@ mod tests {
     fn confirmed_search_highlights_the_current_match_distinctly_from_other_matches() {
         let source = "fox fox fox";
         let blocks = crate::markdown::blocks::lower(source);
-        let layout_doc = layout::layout(&blocks, 80);
+        let layout_doc = layout::layout(&blocks, 80, &crate::image::Sizing::text_only());
         let matches = crate::search::search("fox", &layout_doc);
         assert_eq!(matches.len(), 3);
 
@@ -342,7 +455,7 @@ mod tests {
         let backend = TestBackend::new(20, 3);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render(frame, &app, &blocks, &[], &matches))
+            .draw(|frame| text_render(frame, &app, &blocks, &[], &matches))
             .unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -399,7 +512,11 @@ mod tests {
         let source = "one two three four five six seven eight\n\n# Target";
         let (blocks, headings) = crate::markdown::blocks::lower_with_headings(source);
 
-        let layout_doc = layout::layout(&blocks, main_area.width as usize);
+        let layout_doc = layout::layout(
+            &blocks,
+            main_area.width as usize,
+            &crate::image::Sizing::text_only(),
+        );
         let toc = crate::toc::resolve(&headings, &layout_doc);
         let target_row = toc[0].row;
         assert!(
@@ -416,7 +533,7 @@ mod tests {
         let backend = TestBackend::new(area.width, area.height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render(frame, &app, &blocks, &toc, &[]))
+            .draw(|frame| text_render(frame, &app, &blocks, &toc, &[]))
             .unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -438,7 +555,11 @@ mod tests {
         let (blocks, headings) = crate::markdown::blocks::lower_with_headings(source);
         let area = Rect::new(0, 0, 40, 6);
         let (_, main_area) = split_areas(area, true);
-        let layout_doc = layout::layout(&blocks, main_area.width as usize);
+        let layout_doc = layout::layout(
+            &blocks,
+            main_area.width as usize,
+            &crate::image::Sizing::text_only(),
+        );
         let toc = crate::toc::resolve(&headings, &layout_doc);
 
         let mut app = App::new(layout_doc.total_rows);
@@ -449,7 +570,7 @@ mod tests {
         let backend = TestBackend::new(area.width, area.height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render(frame, &app, &blocks, &toc, &[]))
+            .draw(|frame| text_render(frame, &app, &blocks, &toc, &[]))
             .unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -502,7 +623,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let app = App::new(0);
         terminal
-            .draw(|frame| render(frame, &app, &blocks, &[], &[]))
+            .draw(|frame| text_render(frame, &app, &blocks, &[], &[]))
             .unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -602,7 +723,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let app = App::new(0);
         terminal
-            .draw(|frame| render(frame, &app, &blocks, &[], &[]))
+            .draw(|frame| text_render(frame, &app, &blocks, &[], &[]))
             .unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -625,7 +746,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let app = App::new(0);
         terminal
-            .draw(|frame| render(frame, &app, blocks, &[], &[]))
+            .draw(|frame| text_render(frame, &app, blocks, &[], &[]))
             .unwrap();
         let buffer = terminal.backend().buffer();
         (0..height)
@@ -644,12 +765,15 @@ mod tests {
         app.search_active = true;
         app.search_query = "fox".to_string();
         app.apply_reselection(search::Reselection::FellBackToFirst);
-        let matches = search::search("fox", &layout::layout(&blocks, 60));
+        let matches = search::search(
+            "fox",
+            &layout::layout(&blocks, 60, &crate::image::Sizing::text_only()),
+        );
 
         let backend = TestBackend::new(60, 4);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render(frame, &app, &blocks, &[], &matches))
+            .draw(|frame| text_render(frame, &app, &blocks, &[], &matches))
             .unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -672,7 +796,7 @@ mod tests {
         let backend = TestBackend::new(30, 3);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render(frame, &app, &blocks, &[], &[]))
+            .draw(|frame| text_render(frame, &app, &blocks, &[], &[]))
             .unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -691,5 +815,164 @@ mod tests {
                 .add_modifier
                 .contains(Modifier::ITALIC)
         );
+    }
+
+    #[test]
+    fn a_drawable_image_is_painted_into_the_rows_reserved_for_it() {
+        use ratatui::style::Color;
+        use ratatui_image::FontSize;
+        use ratatui_image::picker::Picker;
+
+        let dir = std::env::temp_dir().join(format!("mdview-ui-image-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("red.png");
+        ::image::RgbImage::from_pixel(40, 40, ::image::Rgb([255, 0, 0]))
+            .save(&file)
+            .unwrap();
+
+        let blocks = crate::markdown::blocks::lower("![Alt](red.png)");
+        let images = Sizing::measure(&dir, FontSize::new(10, 20), ["red.png"]);
+        let layout_doc = layout::layout(&blocks, 20, &images);
+        let mut gallery = Gallery::new(Some(Picker::halfblocks()));
+        let mut app = App::new(layout_doc.total_rows);
+        app.viewport_height = 5;
+
+        let backend = TestBackend::new(20, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    Screen {
+                        app: &app,
+                        blocks: &blocks,
+                        layout_doc: &layout_doc,
+                        toc: &[],
+                        matches: &[],
+                        image_sizing: &images,
+                    },
+                    &mut gallery,
+                )
+            })
+            .unwrap();
+
+        // 40x40 px at a 10x20 cell is 4 cols by 2 rows of half-blocks.
+        assert_eq!(layout_doc.total_rows, 2);
+        let buffer = terminal.backend().buffer();
+        let painted = (0..4).any(|x| {
+            (0..2).any(|y| {
+                let style = buffer.cell((x, y)).unwrap().style();
+                style.fg.is_some_and(|color| color != Color::Reset)
+                    || style.bg.is_some_and(|color| color != Color::Reset)
+            })
+        });
+        assert!(
+            painted,
+            "the image's rows should carry the picture's colours"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A document with a picture in it, written to a scratch directory.
+    fn image_fixture(name: &str, source: &str) -> (std::path::PathBuf, Vec<Block>, Sizing) {
+        use ratatui_image::FontSize;
+
+        let dir = std::env::temp_dir().join(format!("mdview-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        ::image::RgbImage::from_pixel(40, 40, ::image::Rgb([255, 0, 0]))
+            .save(dir.join("red.png"))
+            .unwrap();
+
+        let blocks = crate::markdown::blocks::lower(source);
+        let images = Sizing::measure(&dir, FontSize::new(10, 20), ["red.png"]);
+        (dir, blocks, images)
+    }
+
+    fn row_text(buffer: &ratatui::buffer::Buffer, y: u16, width: u16) -> String {
+        (0..width)
+            .map(|x| buffer.cell((x, y)).unwrap().symbol().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn text_after_an_image_starts_below_the_rows_the_picture_reserved() {
+        use ratatui_image::picker::Picker;
+
+        let (dir, blocks, images) = image_fixture("ui-image-after", "![Alt](red.png)\n\nAfter it.");
+        let layout_doc = layout::layout(&blocks, 20, &images);
+        let mut gallery = Gallery::new(Some(Picker::halfblocks()));
+        let mut app = App::new(layout_doc.total_rows);
+        app.viewport_height = 5;
+
+        let mut terminal = Terminal::new(TestBackend::new(20, 5)).unwrap();
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    Screen {
+                        app: &app,
+                        blocks: &blocks,
+                        layout_doc: &layout_doc,
+                        toc: &[],
+                        matches: &[],
+                        image_sizing: &images,
+                    },
+                    &mut gallery,
+                )
+            })
+            .unwrap();
+
+        // The picture takes rows 0-1, so the paragraph belongs on row 2.
+        let buffer = terminal.backend().buffer();
+        assert!(
+            row_text(buffer, 2, 20).starts_with("After it."),
+            "got: {:?}",
+            row_text(buffer, 2, 20)
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_image_scrolled_half_off_screen_shows_its_placeholder_instead() {
+        use ratatui_image::picker::Picker;
+
+        let (dir, blocks, images) =
+            image_fixture("ui-image-partial", "Above.\n\n![Alt](red.png)\n\nAfter it.");
+        let layout_doc = layout::layout(&blocks, 20, &images);
+        let mut gallery = Gallery::new(Some(Picker::halfblocks()));
+        let mut app = App::new(layout_doc.total_rows);
+        // A two-row viewport with the image's second row at the bottom:
+        // rows are "Above." 0, picture 1-2, "After it." 3.
+        app.viewport_height = 2;
+        app.scroll = 2;
+
+        let mut terminal = Terminal::new(TestBackend::new(20, 2)).unwrap();
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    Screen {
+                        app: &app,
+                        blocks: &blocks,
+                        layout_doc: &layout_doc,
+                        toc: &[],
+                        matches: &[],
+                        image_sizing: &images,
+                    },
+                    &mut gallery,
+                )
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert!(
+            row_text(buffer, 0, 20).contains("[Alt]"),
+            "got: {:?}",
+            row_text(buffer, 0, 20)
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
