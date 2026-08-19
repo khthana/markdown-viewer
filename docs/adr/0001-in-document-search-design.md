@@ -49,7 +49,9 @@ model, and how highlighting composes with already-styled text.
 - **`Esc` was scoped to only clear/exit search** for this issue. The
   PRD's keybinding table groups `Esc` as also closing the TOC sidebar,
   but issue #6's acceptance criteria only covers search — unifying that
-  behavior was deferred rather than bundled in here.
+  behavior was deferred rather than bundled in here. (Issue #15 re-opens
+  this: `Esc` in normal mode still does nothing at all, which issue #12's
+  `?` overlay made visible by documenting the keymap as it stands.)
 
 ## Consequences
 
