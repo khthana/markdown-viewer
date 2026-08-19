@@ -67,7 +67,9 @@ rows of its own — where the surrounding structure allows it.
   rather than the Markdown source.
 - **`theme::image_placeholder_style()`** (dim + italic) keeps the
   placeholder's colors in `theme.rs` with every other palette decision,
-  rather than inline in the layout pass.
+  rather than inline in the layout pass. (Superseded in form by ADR-0007:
+  it is `Palette::image_placeholder_style` now, since the palette is
+  chosen per run. The decision itself stands.)
 
 ## Consequences
 
