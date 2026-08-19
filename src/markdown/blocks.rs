@@ -8,8 +8,29 @@ pub enum Inline {
     Bold(Vec<Inline>),
     Italic(Vec<Inline>),
     Strikethrough(Vec<Inline>),
-    Link { text: Vec<Inline>, url: String },
+    Link {
+        text: Vec<Inline>,
+        url: String,
+    },
     FootnoteReference(String),
+    /// An image that can't be given rows of its own — one inside a
+    /// heading, a link, a table cell, or an emphasis span, where hoisting
+    /// it out to a block would destroy the structure around it. It
+    /// renders as the same placeholder label, inline with the text.
+    Image {
+        alt: String,
+        path: String,
+    },
+}
+
+/// Whether the inline frame being filled belongs to something an image
+/// may interrupt — a paragraph, or a tight list item's own text — or to
+/// an inline span (heading text, link label, table cell, emphasis) where
+/// emitting a block would tear the surrounding structure apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Frame {
+    Interruptible,
+    InlineOnly,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +71,15 @@ pub enum Block {
         header: Vec<Vec<Inline>>,
         rows: Vec<Vec<Vec<Inline>>>,
     },
+    /// `![alt](path)`. Markdown treats an image as inline, but this app
+    /// renders it as a block: later tiers paint real graphics into the
+    /// block's own row range, which can't be done to part of a line of
+    /// text. `alt` is exactly what the document said (possibly empty) —
+    /// the placeholder label is derived at render time.
+    Image {
+        alt: String,
+        path: String,
+    },
 }
 
 /// A heading collected during the lowering pass, for TOC construction.
@@ -87,7 +117,7 @@ pub fn lower_with_headings(source: &str) -> (Vec<Block>, Vec<HeadingRef>) {
     let mut headings = Vec::new();
     let mut blocks = Vec::new();
     let mut containers: Vec<Vec<Block>> = Vec::new();
-    let mut stack: Vec<Vec<Inline>> = Vec::new();
+    let mut stack: Vec<(Frame, Vec<Inline>)> = Vec::new();
     let mut link_urls: Vec<String> = Vec::new();
     let mut code_block: Option<(Option<String>, String)> = None;
     let mut list_stack: Vec<(bool, Vec<Vec<Block>>)> = Vec::new();
@@ -101,19 +131,34 @@ pub fn lower_with_headings(source: &str) -> (Vec<Block>, Vec<HeadingRef>) {
     let mut table_header: Vec<Vec<Inline>> = Vec::new();
     let mut table_rows: Vec<Vec<Vec<Inline>>> = Vec::new();
     let mut table_current_row: Vec<Vec<Inline>> = Vec::new();
+    let mut image_urls: Vec<String> = Vec::new();
 
     for event in parser::parse(source) {
         match event {
+            CmEvent::Start(Tag::Paragraph) => push_frame(&mut stack, Frame::Interruptible),
             CmEvent::Start(
-                Tag::Paragraph
-                | Tag::Heading { .. }
-                | Tag::Strong
-                | Tag::Emphasis
-                | Tag::Strikethrough,
-            ) => stack.push(Vec::new()),
+                Tag::Heading { .. } | Tag::Strong | Tag::Emphasis | Tag::Strikethrough,
+            ) => push_frame(&mut stack, Frame::InlineOnly),
+            CmEvent::Start(Tag::Image { dest_url, .. }) => {
+                image_urls.push(dest_url.into_string());
+                push_frame(&mut stack, Frame::InlineOnly);
+            }
+            CmEvent::End(TagEnd::Image) => {
+                let alt = flatten_plain_text(&pop_inlines(&mut stack));
+                let path = image_urls.pop().unwrap_or_default();
+                if let Some((Frame::Interruptible, _)) = stack.last() {
+                    // Give the image rows of its own: text before it is
+                    // closed off as a paragraph, and the rest continues in
+                    // a fresh one after it.
+                    flush_pending_item_text(&mut stack, &mut blocks, &mut containers);
+                    push_block(&mut blocks, &mut containers, Block::Image { alt, path });
+                } else {
+                    push_inline(&mut stack, Inline::Image { alt, path });
+                }
+            }
             CmEvent::Start(Tag::Link { dest_url, .. }) => {
                 link_urls.push(dest_url.into_string());
-                stack.push(Vec::new());
+                push_frame(&mut stack, Frame::InlineOnly);
             }
             CmEvent::Start(Tag::CodeBlock(kind)) => {
                 flush_pending_item_text(&mut stack, &mut blocks, &mut containers);
@@ -139,9 +184,9 @@ pub fn lower_with_headings(source: &str) -> (Vec<Block>, Vec<HeadingRef>) {
                 flush_pending_item_text(&mut stack, &mut blocks, &mut containers);
                 table_alignments = alignments.iter().map(|a| column_alignment(*a)).collect();
             }
-            CmEvent::Start(Tag::TableCell) => stack.push(Vec::new()),
+            CmEvent::Start(Tag::TableCell) => push_frame(&mut stack, Frame::InlineOnly),
             CmEvent::End(TagEnd::TableCell) => {
-                let cell = stack.pop().unwrap_or_default();
+                let cell = pop_inlines(&mut stack);
                 table_current_row.push(cell);
             }
             CmEvent::End(TagEnd::TableHead) => {
@@ -171,7 +216,7 @@ pub fn lower_with_headings(source: &str) -> (Vec<Block>, Vec<HeadingRef>) {
             // and an inline frame so either shape lands in the right place.
             CmEvent::Start(Tag::Item) => {
                 containers.push(Vec::new());
-                stack.push(Vec::new());
+                push_frame(&mut stack, Frame::Interruptible);
                 task_marker_stack.push(None);
             }
             CmEvent::TaskListMarker(checked) => {
@@ -180,7 +225,7 @@ pub fn lower_with_headings(source: &str) -> (Vec<Block>, Vec<HeadingRef>) {
                 }
             }
             CmEvent::End(TagEnd::Item) => {
-                let direct_text = stack.pop().unwrap_or_default();
+                let direct_text = pop_inlines(&mut stack);
                 if !direct_text.is_empty() {
                     push_block(&mut blocks, &mut containers, Block::Paragraph(direct_text));
                 }
@@ -206,11 +251,16 @@ pub fn lower_with_headings(source: &str) -> (Vec<Block>, Vec<HeadingRef>) {
                 }
             }
             CmEvent::End(TagEnd::Paragraph) => {
-                let text = stack.pop().unwrap_or_default();
-                push_block(&mut blocks, &mut containers, Block::Paragraph(text));
+                let text = pop_inlines(&mut stack);
+                // A paragraph holding nothing but an image has already had
+                // its content emitted as an Image block; don't follow it
+                // with an empty paragraph.
+                if !text.is_empty() {
+                    push_block(&mut blocks, &mut containers, Block::Paragraph(text));
+                }
             }
             CmEvent::End(TagEnd::Heading(level)) => {
-                let text = stack.pop().unwrap_or_default();
+                let text = pop_inlines(&mut stack);
                 if containers.is_empty() {
                     headings.push(HeadingRef {
                         level: level as u8,
@@ -228,19 +278,19 @@ pub fn lower_with_headings(source: &str) -> (Vec<Block>, Vec<HeadingRef>) {
                 );
             }
             CmEvent::End(TagEnd::Strong) => {
-                let inner = stack.pop().unwrap_or_default();
+                let inner = pop_inlines(&mut stack);
                 push_inline(&mut stack, Inline::Bold(inner));
             }
             CmEvent::End(TagEnd::Emphasis) => {
-                let inner = stack.pop().unwrap_or_default();
+                let inner = pop_inlines(&mut stack);
                 push_inline(&mut stack, Inline::Italic(inner));
             }
             CmEvent::End(TagEnd::Strikethrough) => {
-                let inner = stack.pop().unwrap_or_default();
+                let inner = pop_inlines(&mut stack);
                 push_inline(&mut stack, Inline::Strikethrough(inner));
             }
             CmEvent::End(TagEnd::Link) => {
-                let text = stack.pop().unwrap_or_default();
+                let text = pop_inlines(&mut stack);
                 if let Some(url) = link_urls.pop() {
                     push_inline(&mut stack, Inline::Link { text, url });
                 }
@@ -274,6 +324,26 @@ pub fn lower_with_headings(source: &str) -> (Vec<Block>, Vec<HeadingRef>) {
     (blocks, headings)
 }
 
+/// What to call an image in place of the image itself: its alt text, or
+/// — when the document gave none — the file's name, which is usually
+/// descriptive enough to be worth showing. Falls back to the raw path,
+/// and finally to a generic word, so the reader never faces an empty
+/// label.
+pub fn image_label(alt: &str, path: &str) -> String {
+    if !alt.trim().is_empty() {
+        return alt.to_string();
+    }
+    let file_name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path);
+    if file_name.trim().is_empty() {
+        "image".to_string()
+    } else {
+        file_name.to_string()
+    }
+}
+
 /// Flattens inline spans down to their plain text content, e.g. for TOC
 /// entry labels where inline styling doesn't apply.
 pub fn flatten_plain_text(inlines: &[Inline]) -> String {
@@ -286,6 +356,7 @@ pub fn flatten_plain_text(inlines: &[Inline]) -> String {
             | Inline::Strikethrough(inner)
             | Inline::Link { text: inner, .. } => out.push_str(&flatten_plain_text(inner)),
             Inline::FootnoteReference(label) => out.push_str(&format!("[^{label}]")),
+            Inline::Image { alt, path } => out.push_str(&format!("[{}]", image_label(alt, path))),
         }
     }
     out
@@ -300,10 +371,20 @@ fn column_alignment(alignment: Alignment) -> ColumnAlignment {
     }
 }
 
-fn push_inline(stack: &mut [Vec<Inline>], inline: Inline) {
-    if let Some(top) = stack.last_mut() {
+fn push_inline(stack: &mut [(Frame, Vec<Inline>)], inline: Inline) {
+    if let Some((_, top)) = stack.last_mut() {
         top.push(inline);
     }
+}
+
+/// Opens a fresh inline frame of the given kind.
+fn push_frame(stack: &mut Vec<(Frame, Vec<Inline>)>, frame: Frame) {
+    stack.push((frame, Vec::new()));
+}
+
+/// Closes the innermost inline frame, returning what it collected.
+fn pop_inlines(stack: &mut Vec<(Frame, Vec<Inline>)>) -> Vec<Inline> {
+    stack.pop().map(|(_, inlines)| inlines).unwrap_or_default()
 }
 
 /// Pushes a finished block into the innermost open container (blockquote,
@@ -322,11 +403,11 @@ fn push_block(blocks: &mut Vec<Block>, containers: &mut [Vec<Block>], block: Blo
 /// preserved. The frame itself is cleared, not popped, so `Item`'s own
 /// push/pop stays balanced.
 fn flush_pending_item_text(
-    stack: &mut [Vec<Inline>],
+    stack: &mut [(Frame, Vec<Inline>)],
     blocks: &mut Vec<Block>,
     containers: &mut [Vec<Block>],
 ) {
-    if let Some(top) = stack.last_mut()
+    if let Some((_, top)) = stack.last_mut()
         && !top.is_empty()
     {
         let text = std::mem::take(top);
@@ -602,5 +683,127 @@ mod tests {
         );
         // The wrapper `lower()` returns the same blocks lower_with_headings does.
         assert_eq!(blocks, lower(source));
+    }
+
+    #[test]
+    fn an_image_lowers_to_an_image_block_with_its_alt_text_and_path() {
+        let blocks = lower("![A diagram](diagram.png)");
+
+        assert_eq!(
+            blocks,
+            vec![Block::Image {
+                alt: "A diagram".to_string(),
+                path: "diagram.png".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn an_image_without_alt_text_keeps_an_empty_alt_and_its_path() {
+        let blocks = lower("![](photos/holiday.jpg)");
+
+        assert_eq!(
+            blocks,
+            vec![Block::Image {
+                alt: String::new(),
+                path: "photos/holiday.jpg".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn an_image_path_that_points_nowhere_lowers_like_any_other() {
+        let blocks = lower("![missing](does/not/exist.png)");
+
+        assert_eq!(
+            blocks,
+            vec![Block::Image {
+                alt: "missing".to_string(),
+                path: "does/not/exist.png".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn an_image_mid_paragraph_splits_the_text_around_it() {
+        let blocks = lower("before ![chart](chart.png) after");
+
+        assert_eq!(
+            blocks,
+            vec![
+                Block::Paragraph(vec![Inline::Text("before ".to_string())]),
+                Block::Image {
+                    alt: "chart".to_string(),
+                    path: "chart.png".to_string(),
+                },
+                Block::Paragraph(vec![Inline::Text(" after".to_string())]),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_image_in_a_heading_stays_inline_and_leaves_the_heading_intact() {
+        let (blocks, headings) = lower_with_headings("# Title ![logo](l.png)");
+
+        assert_eq!(
+            blocks,
+            vec![Block::Heading {
+                level: 1,
+                text: vec![
+                    Inline::Text("Title ".to_string()),
+                    Inline::Image {
+                        alt: "logo".to_string(),
+                        path: "l.png".to_string(),
+                    },
+                ],
+            }]
+        );
+        assert_eq!(headings[0].text, "Title [logo]");
+    }
+
+    #[test]
+    fn a_badge_image_stays_inside_its_link() {
+        let blocks = lower("[![Build](badge.svg)](https://ci.example.com)");
+
+        assert_eq!(
+            blocks,
+            vec![Block::Paragraph(vec![Inline::Link {
+                text: vec![Inline::Image {
+                    alt: "Build".to_string(),
+                    path: "badge.svg".to_string(),
+                }],
+                url: "https://ci.example.com".to_string(),
+            }])]
+        );
+    }
+
+    #[test]
+    fn an_image_in_a_table_cell_stays_in_the_cell() {
+        let blocks = lower("| a |\n|---|\n| ![i](p.png) |");
+
+        assert_eq!(
+            blocks,
+            vec![Block::Table {
+                alignments: vec![ColumnAlignment::None],
+                header: vec![vec![Inline::Text("a".to_string())]],
+                rows: vec![vec![vec![Inline::Image {
+                    alt: "i".to_string(),
+                    path: "p.png".to_string(),
+                }]]],
+            }]
+        );
+    }
+
+    #[test]
+    fn an_image_inside_emphasis_stays_inline() {
+        let blocks = lower("**![x](y.png)**");
+
+        assert_eq!(
+            blocks,
+            vec![Block::Paragraph(vec![Inline::Bold(vec![Inline::Image {
+                alt: "x".to_string(),
+                path: "y.png".to_string(),
+            }])])]
+        );
     }
 }

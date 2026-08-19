@@ -1,7 +1,7 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::markdown::blocks::{Block, ColumnAlignment, Inline, flatten_plain_text};
+use crate::markdown::blocks::{self, Block, ColumnAlignment, Inline, flatten_plain_text};
 use crate::theme;
 
 /// One block's assigned position in the document's virtual row space.
@@ -55,6 +55,12 @@ pub fn layout(blocks: &[Block], width: usize) -> LayoutDoc {
     }
 }
 
+/// An image's stand-in text: a frame glyph plus whatever the image is
+/// called (see `blocks::image_label`).
+fn image_placeholder(alt: &str, path: &str) -> String {
+    format!("\u{1f5bc} [{}]", blocks::image_label(alt, path))
+}
+
 /// Concatenates a line's spans down to their plain text, discarding style.
 fn line_plain_text(line: &Line<'static>) -> String {
     line.spans.iter().map(|s| s.content.as_ref()).collect()
@@ -99,6 +105,15 @@ fn render_block(block: &Block, width: usize, out: &mut Vec<Line<'static>>) {
             for spans in wrap_words(&words, width.max(1)) {
                 out.push(Line::from(spans));
             }
+        }
+        Block::Image { alt, path } => {
+            // Exactly one row, at any width: the reserved height is fixed
+            // in this tier, and a placeholder that wrapped would make the
+            // document's height depend on the terminal's width.
+            out.push(Line::from(Span::styled(
+                image_placeholder(alt, path),
+                theme::image_placeholder_style(),
+            )));
         }
         Block::HorizontalRule => {
             out.push(Line::from(Span::raw("─".repeat(width.max(1)))));
@@ -309,6 +324,14 @@ fn collect_words(inlines: &[Inline], style: Style, out: &mut Vec<(String, Style)
                 let marker_style = style.fg(Color::Cyan).add_modifier(Modifier::BOLD);
                 out.push((format!("[^{label}]"), marker_style));
             }
+            // Pushed as one unbreakable word so the icon never wraps away
+            // from the label it belongs to.
+            Inline::Image { alt, path } => {
+                out.push((
+                    image_placeholder(alt, path),
+                    theme::image_placeholder_style(),
+                ));
+            }
         }
     }
 }
@@ -492,5 +515,48 @@ mod tests {
                 "mismatch at width {width}"
             );
         }
+    }
+
+    fn image(alt: &str, path: &str) -> Block {
+        Block::Image {
+            alt: alt.to_string(),
+            path: path.to_string(),
+        }
+    }
+
+    #[test]
+    fn an_image_reserves_one_row_whatever_the_width() {
+        let blocks = vec![
+            text_paragraph("before"),
+            image("A diagram of the pipeline", "diagram.png"),
+            text_paragraph("after"),
+        ];
+
+        for width in [80, 20] {
+            let doc = layout(&blocks, width);
+            assert_eq!(doc.blocks[1].row_count, 1, "at width {width}");
+            assert_eq!(doc.blocks[2].row_start, 2, "at width {width}");
+        }
+    }
+
+    #[test]
+    fn an_images_reserved_row_holds_its_placeholder_text() {
+        let doc = layout(&[image("A diagram", "diagram.png")], 80);
+
+        assert_eq!(doc.rows, vec!["\u{1f5bc} [A diagram]".to_string()]);
+    }
+
+    #[test]
+    fn an_image_without_alt_text_falls_back_to_its_file_name() {
+        let doc = layout(&[image("", "photos/holiday.jpg")], 80);
+
+        assert_eq!(doc.rows, vec!["\u{1f5bc} [holiday.jpg]".to_string()]);
+    }
+
+    #[test]
+    fn an_image_with_no_alt_text_and_no_file_name_still_gets_a_label() {
+        let doc = layout(&[image("", "")], 80);
+
+        assert_eq!(doc.rows, vec!["\u{1f5bc} [image]".to_string()]);
     }
 }

@@ -57,6 +57,14 @@ pub fn search_current_match_style() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
+/// Styling for an image's alt-text placeholder: dimmed and italic, so it
+/// reads as a stand-in for content rather than as body text.
+pub fn image_placeholder_style() -> Style {
+    Style::new()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::ITALIC)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

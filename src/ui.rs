@@ -661,4 +661,35 @@ mod tests {
             "got: {status_row:?}"
         );
     }
+
+    #[test]
+    fn an_image_renders_as_a_styled_alt_text_placeholder() {
+        // The path points nowhere: this tier never opens the file, so a
+        // broken reference renders like any other image.
+        let blocks = crate::markdown::blocks::lower("![A diagram](does/not/exist.png)");
+        let app = App::new(1);
+
+        let backend = TestBackend::new(30, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, &app, &blocks, &[], &[]))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let first_row: String = (0..30)
+            .map(|x| buffer.cell((x, 0)).unwrap().symbol().to_string())
+            .collect();
+        assert!(
+            first_row.contains("\u{1f5bc} [A diagram]"),
+            "got: {first_row:?}"
+        );
+        assert!(
+            buffer
+                .cell((0, 0))
+                .unwrap()
+                .style()
+                .add_modifier
+                .contains(Modifier::ITALIC)
+        );
+    }
 }
