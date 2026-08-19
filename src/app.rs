@@ -50,6 +50,21 @@ pub enum Action {
     Reload,
 }
 
+impl Action {
+    /// Whether this action is the user driving the search themselves, as
+    /// opposed to navigating or reloading.
+    fn is_search_step(self) -> bool {
+        matches!(
+            self,
+            Action::EnterSearch
+                | Action::ConfirmSearch
+                | Action::ExitSearch
+                | Action::NextMatch
+                | Action::PrevMatch
+        )
+    }
+}
+
 /// Pure decision function: given the current state and a keypress, what
 /// action should the app take? Contains no side effects, so it's testable
 /// without a terminal.
@@ -149,6 +164,10 @@ pub struct App {
     /// UI shows highlights/a match-count vs. nothing.
     pub search_active: bool,
     pub current_match: Option<usize>,
+    /// Set when a reload couldn't find the previously selected match and
+    /// selection fell back to the first one, so the status line can say
+    /// so. Cleared as soon as the user moves the search on.
+    pub search_fell_back: bool,
     pending_g: bool,
 }
 
@@ -165,7 +184,30 @@ impl App {
             search_query: String::new(),
             search_active: false,
             current_match: None,
+            search_fell_back: false,
             pending_g: false,
+        }
+    }
+
+    /// Applies the outcome of re-running the active query after a reload.
+    pub fn apply_reselection(&mut self, reselection: search::Reselection) {
+        match reselection {
+            search::Reselection::Preserved(index) => {
+                self.current_match = Some(index);
+                self.search_fell_back = false;
+            }
+            search::Reselection::SelectedFirst => {
+                self.current_match = Some(0);
+                self.search_fell_back = false;
+            }
+            search::Reselection::FellBackToFirst => {
+                self.current_match = Some(0);
+                self.search_fell_back = true;
+            }
+            search::Reselection::NoMatches => {
+                self.current_match = None;
+                self.search_fell_back = false;
+            }
         }
     }
 
@@ -191,6 +233,11 @@ impl App {
         };
         let action = handle_key(&state, key);
         self.pending_g = matches!(key.code, KeyCode::Char('g')) && !self.pending_g;
+        // Any deliberate search step supersedes the note about a reload
+        // having moved the selection.
+        if action.is_search_step() {
+            self.search_fell_back = false;
+        }
 
         match action {
             Action::LineDown => self.scroll = (self.scroll + 1).min(self.max_scroll()),
@@ -754,5 +801,69 @@ mod tests {
             handle_key(&focused, key(KeyCode::Char('r'))),
             Action::Reload
         );
+    }
+
+    #[test]
+    fn a_preserved_match_stays_selected_without_a_note() {
+        let mut app = App::new(10);
+        app.search_active = true;
+        app.current_match = Some(1);
+
+        app.apply_reselection(search::Reselection::Preserved(2));
+
+        assert_eq!(app.current_match, Some(2));
+        assert!(!app.search_fell_back);
+    }
+
+    #[test]
+    fn a_lost_match_selects_the_first_and_notes_the_fallback() {
+        let mut app = App::new(10);
+        app.search_active = true;
+        app.current_match = Some(1);
+
+        app.apply_reselection(search::Reselection::FellBackToFirst);
+
+        assert_eq!(app.current_match, Some(0));
+        assert!(app.search_fell_back);
+    }
+
+    #[test]
+    fn a_query_that_stops_matching_clears_the_selection() {
+        let mut app = App::new(10);
+        app.search_active = true;
+        app.current_match = Some(1);
+
+        app.apply_reselection(search::Reselection::NoMatches);
+
+        assert_eq!(app.current_match, None);
+        assert!(!app.search_fell_back);
+    }
+
+    #[test]
+    fn moving_to_another_match_clears_the_fallback_note() {
+        let mut app = App::new(10);
+        app.viewport_height = 5;
+        app.search_active = true;
+        app.apply_reselection(search::Reselection::FellBackToFirst);
+
+        app.on_key(
+            key(KeyCode::Char('n')),
+            &[],
+            &[a_match(0, 0, 3), a_match(1, 0, 3)],
+        );
+
+        assert!(!app.search_fell_back, "n moves on from the fallback");
+    }
+
+    #[test]
+    fn a_first_selection_after_a_reload_carries_no_fallback_note() {
+        let mut app = App::new(10);
+        app.search_active = true;
+        app.current_match = None;
+
+        app.apply_reselection(search::Reselection::SelectedFirst);
+
+        assert_eq!(app.current_match, Some(0));
+        assert!(!app.search_fell_back);
     }
 }

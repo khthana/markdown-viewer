@@ -156,6 +156,15 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App, matches: &[search::Ma
         format!("/{}", app.search_query)
     } else if app.search_active && matches.is_empty() {
         format!("No matches for \"{}\"", app.search_query)
+    } else if app.search_fell_back {
+        // Only shown after a reload dropped the selected match: the count
+        // is worth stating precisely because the document just changed
+        // under the reader.
+        format!(
+            "Match 1/{} for \"{}\" (previous match gone)",
+            matches.len(),
+            app.search_query
+        )
     } else {
         String::new()
     };
@@ -626,5 +635,30 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    #[test]
+    fn a_reload_that_moved_the_selection_says_so_on_the_status_line() {
+        let blocks = crate::markdown::blocks::lower("fox one\n\nfox two");
+        let mut app = App::new(0);
+        app.search_active = true;
+        app.search_query = "fox".to_string();
+        app.apply_reselection(search::Reselection::FellBackToFirst);
+        let matches = search::search("fox", &layout::layout(&blocks, 60));
+
+        let backend = TestBackend::new(60, 4);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, &app, &blocks, &[], &matches))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let status_row: String = (0..60)
+            .map(|x| buffer.cell((x, 3)).unwrap().symbol().to_string())
+            .collect();
+        assert!(
+            status_row.contains("Match 1/2 for \"fox\" (previous match gone)"),
+            "got: {status_row:?}"
+        );
     }
 }

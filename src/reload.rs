@@ -5,6 +5,7 @@ use anyhow::Context;
 use crate::app::{self, App};
 use crate::markdown::blocks::{self, Block, HeadingRef};
 use crate::markdown::layout::{self, LayoutDoc};
+use crate::search;
 use crate::toc::{self, TocEntry};
 
 /// What the user's scroll position was pinned to when a reload started.
@@ -46,7 +47,9 @@ pub fn load(path: &Path) -> anyhow::Result<Document> {
 }
 
 /// Re-reads the file and swaps in the new document, moving `app`'s scroll
-/// position to wherever the old document's anchor now lives.
+/// position to wherever the old document's anchor now lives and, when a
+/// search is active, re-running the query and re-selecting the equivalent
+/// match in the new text.
 ///
 /// A read failure leaves the current document on screen rather than
 /// erroring out: a save in progress can leave the file momentarily
@@ -59,11 +62,20 @@ pub fn reload_preserving_position(
     width: usize,
 ) {
     let anchor = compute_anchor(&document.headings, layout_doc, app.scroll);
+    let match_anchor = search::anchor_match(&app.search_query, layout_doc, app.current_match);
     let Ok(fresh) = load(path) else { return };
 
     let new_layout = layout::layout(&fresh.blocks, width);
     app.total_rows = new_layout.total_rows;
     app.scroll = resolve_anchor(&anchor, &fresh.headings, &new_layout, app.viewport_height);
+    // The scroll position stays where the document anchor put it: the
+    // reader's place in the text outranks the selected match, which they
+    // can step back to with `n`.
+    if app.search_active {
+        let reselection =
+            search::resolve_match(match_anchor.as_ref(), &app.search_query, &new_layout);
+        app.apply_reselection(reselection);
+    }
     *document = fresh;
 }
 
@@ -432,5 +444,112 @@ Body.");
         assert_eq!(document.blocks.len(), block_count);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A viewer parked on a match of `query` in a file containing
+    /// `source`, ready for the file to be rewritten and reloaded.
+    struct SearchSession {
+        dir: std::path::PathBuf,
+        path: std::path::PathBuf,
+        document: Document,
+        layout: LayoutDoc,
+        app: App,
+    }
+
+    impl SearchSession {
+        fn open(name: &str, source: &str, query: &str, current: Option<usize>) -> Self {
+            let dir = scratch_dir(name);
+            let path = dir.join("notes.md");
+            std::fs::write(&path, source).unwrap();
+
+            let document = load(&path).unwrap();
+            let layout = layout::layout(&document.blocks, WIDTH);
+            let mut app = App::new(layout.total_rows);
+            app.viewport_height = VIEWPORT;
+            app.search_query = query.to_string();
+            app.search_active = true;
+            app.current_match = current;
+
+            Self {
+                dir,
+                path,
+                document,
+                layout,
+                app,
+            }
+        }
+
+        /// Rewrites the file the way an editor's save would, then reloads.
+        fn save_and_reload(&mut self, source: &str) {
+            std::fs::write(&self.path, source).unwrap();
+            reload_preserving_position(
+                &self.path,
+                &mut self.document,
+                &mut self.app,
+                &self.layout,
+                WIDTH,
+            );
+        }
+    }
+
+    impl Drop for SearchSession {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.dir).ok();
+        }
+    }
+
+    #[test]
+    fn reloading_keeps_the_same_search_match_selected() {
+        // Parked on the "fox" in "fox two".
+        let mut session =
+            SearchSession::open("reload-search", "fox one\n\nfox two", "fox", Some(1));
+
+        // A new occurrence above shifts the match list by one.
+        session.save_and_reload("fox zero\n\nfox one\n\nfox two");
+
+        assert_eq!(session.app.current_match, Some(2), "same match, new index");
+        assert!(!session.app.search_fell_back);
+    }
+
+    #[test]
+    fn reloading_after_the_selected_match_is_deleted_falls_back_to_the_first() {
+        let mut session =
+            SearchSession::open("reload-search-lost", "fox one\n\nfox two", "fox", Some(1));
+
+        session.save_and_reload("fox one");
+
+        assert_eq!(session.app.current_match, Some(0));
+        assert!(
+            session.app.search_fell_back,
+            "the status line should note the move"
+        );
+    }
+
+    #[test]
+    fn reloading_a_document_that_no_longer_matches_clears_the_selection() {
+        let mut session =
+            SearchSession::open("reload-search-gone", "fox one\n\nfox two", "fox", Some(1));
+
+        session.save_and_reload("nothing here now");
+
+        assert_eq!(session.app.current_match, None);
+        assert!(
+            session.app.search_active,
+            "the query stays active, showing no matches"
+        );
+    }
+
+    #[test]
+    fn reloading_selects_a_match_for_a_query_that_previously_matched_nothing() {
+        // A confirmed search with no matches leaves nothing selected.
+        let mut session = SearchSession::open("reload-search-appears", "nothing here", "fox", None);
+
+        session.save_and_reload("a fox appears");
+
+        assert_eq!(session.app.current_match, Some(0));
+        assert!(
+            !session.app.search_fell_back,
+            "there was no earlier match to lose"
+        );
     }
 }
