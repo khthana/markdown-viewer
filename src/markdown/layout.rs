@@ -1,9 +1,9 @@
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::image::Sizing;
 use crate::markdown::blocks::{self, Block, ColumnAlignment, Inline, flatten_plain_text};
-use crate::theme;
+use crate::theme::Palette;
 
 /// One block's assigned position in the document's virtual row space.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,14 +31,19 @@ pub struct LayoutDoc {
 /// counting algorithm — otherwise the two are guaranteed to drift (e.g. a
 /// heading's rule line getting counted for rendering but not for
 /// scrolling).
-pub fn layout(blocks: &[Block], width: usize, images: &Sizing) -> LayoutDoc {
+pub fn layout(blocks: &[Block], width: usize, images: &Sizing, palette: Palette) -> LayoutDoc {
+    let ctx = Ctx {
+        width,
+        images,
+        palette,
+    };
     let mut laid_out = Vec::with_capacity(blocks.len());
     let mut rows = Vec::new();
     let mut row_start = 0;
 
     for (block_index, block) in blocks.iter().enumerate() {
         let mut scratch = Vec::new();
-        render_block(block, width, images, &mut scratch);
+        render_block(block, ctx, &mut scratch);
         let row_count = scratch.len();
         rows.extend(scratch.iter().map(line_plain_text));
         laid_out.push(LaidOutBlock {
@@ -66,21 +71,47 @@ fn line_plain_text(line: &Line<'static>) -> String {
 /// on-screen rendering (`ui::render`) and row-count bookkeeping
 /// (`layout`), so the two can never disagree about how many rows a
 /// document occupies.
-pub fn render_lines(blocks: &[Block], width: usize, images: &Sizing) -> Vec<Line<'static>> {
+pub fn render_lines(
+    blocks: &[Block],
+    width: usize,
+    images: &Sizing,
+    palette: Palette,
+) -> Vec<Line<'static>> {
+    let ctx = Ctx {
+        width,
+        images,
+        palette,
+    };
     let mut lines = Vec::new();
     for block in blocks {
-        render_block(block, width, images, &mut lines);
+        render_block(block, ctx, &mut lines);
     }
     lines
 }
 
-fn render_block(block: &Block, width: usize, images: &Sizing, out: &mut Vec<Line<'static>>) {
+/// What rendering one block needs to know beyond the block itself. These
+/// three always travel together — the width a block wraps at, how its
+/// images are sized, and what it's painted in — so they're carried as one
+/// value rather than threaded through every recursive call separately.
+#[derive(Clone, Copy)]
+struct Ctx<'a> {
+    width: usize,
+    images: &'a Sizing,
+    palette: Palette,
+}
+
+fn render_block(block: &Block, ctx: Ctx<'_>, out: &mut Vec<Line<'static>>) {
+    let Ctx {
+        width,
+        images,
+        palette,
+    } = ctx;
     match block {
         Block::Heading { level, text } => {
-            let hs = theme::heading_style(*level);
+            let hs = palette.heading_style(*level);
             let indent = hs.indent as usize;
             let content_width = width.saturating_sub(indent).max(1);
-            let words = styled_words(text, hs.style);
+            let words = styled_words(text, hs.style, palette);
             for spans in wrap_words(&words, content_width) {
                 let mut spans = spans;
                 if indent > 0 {
@@ -88,15 +119,15 @@ fn render_block(block: &Block, width: usize, images: &Sizing, out: &mut Vec<Line
                 }
                 out.push(Line::from(spans));
             }
-            if let Some(color) = hs.rule_color {
+            if let Some(rule_style) = hs.rule_style {
                 out.push(Line::from(Span::styled(
                     "─".repeat(width.max(1)),
-                    Style::new().fg(color),
+                    rule_style,
                 )));
             }
         }
         Block::Paragraph(inlines) => {
-            let words = styled_words(inlines, Style::default());
+            let words = styled_words(inlines, Style::default(), palette);
             for spans in wrap_words(&words, width.max(1)) {
                 out.push(Line::from(spans));
             }
@@ -114,7 +145,7 @@ fn render_block(block: &Block, width: usize, images: &Sizing, out: &mut Vec<Line
                 // make the document's height depend on the terminal's.
                 out.push(Line::from(Span::styled(
                     blocks::image_placeholder(alt, path),
-                    theme::image_placeholder_style(),
+                    palette.image_placeholder_style(),
                 )));
             }
         }
@@ -122,17 +153,19 @@ fn render_block(block: &Block, width: usize, images: &Sizing, out: &mut Vec<Line
             out.push(Line::from(Span::raw("─".repeat(width.max(1)))));
         }
         Block::Code { lang, text } => {
-            out.extend(crate::highlight::highlight_code(text, lang.as_deref()));
+            out.extend(crate::highlight::highlight_code(
+                text,
+                lang.as_deref(),
+                palette,
+            ));
         }
         Block::Blockquote(inner) => {
             // Uses the full width (not narrowed for the "│ " prefix) so
             // the prefix doesn't shift wrap points relative to row counts.
-            let quote_style = Style::new()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC);
+            let quote_style = palette.blockquote_style();
             let mut inner_lines = Vec::new();
             for b in inner {
-                render_block(b, width, images, &mut inner_lines);
+                render_block(b, ctx, &mut inner_lines);
             }
             for line in inner_lines {
                 let mut spans = vec![Span::styled("\u{2502} ", quote_style)];
@@ -158,14 +191,14 @@ fn render_block(block: &Block, width: usize, images: &Sizing, out: &mut Vec<Line
                         (glyph, item.as_slice())
                     }
                 };
-                render_list_item(&bullet, content, width, images, out);
+                render_list_item(&bullet, content, ctx, out);
             }
         }
         Block::TaskListItem { checked, content } => {
-            render_list_item(&task_glyph(*checked), content, width, images, out);
+            render_list_item(&task_glyph(*checked), content, ctx, out);
         }
         Block::FootnoteDefinition { label, content } => {
-            render_list_item(&format!("[^{label}]: "), content, width, images, out);
+            render_list_item(&format!("[^{label}]: "), content, ctx, out);
         }
         Block::Table {
             alignments,
@@ -277,19 +310,13 @@ fn task_glyph(checked: bool) -> String {
 
 /// Renders a list item's blocks with `bullet` prefixed on the first line
 /// and blank padding aligning continuation lines under it.
-fn render_list_item(
-    bullet: &str,
-    content: &[Block],
-    width: usize,
-    images: &Sizing,
-    out: &mut Vec<Line<'static>>,
-) {
+fn render_list_item(bullet: &str, content: &[Block], ctx: Ctx<'_>, out: &mut Vec<Line<'static>>) {
     let bullet_width = bullet.chars().count();
     // Uses the full width (not narrowed for the bullet) so the bullet
     // doesn't shift wrap points relative to row counts.
     let mut item_lines = Vec::new();
     for b in content {
-        render_block(b, width, images, &mut item_lines);
+        render_block(b, ctx, &mut item_lines);
     }
     for (j, line) in item_lines.into_iter().enumerate() {
         let prefix = if j == 0 {
@@ -305,13 +332,18 @@ fn render_list_item(
 
 /// Flattens inline spans (bold, italic, link text) into whitespace-split
 /// words tagged with their resolved style.
-fn styled_words(inlines: &[Inline], style: Style) -> Vec<(String, Style)> {
+fn styled_words(inlines: &[Inline], style: Style, palette: Palette) -> Vec<(String, Style)> {
     let mut words = Vec::new();
-    collect_words(inlines, style, &mut words);
+    collect_words(inlines, style, palette, &mut words);
     words
 }
 
-fn collect_words(inlines: &[Inline], style: Style, out: &mut Vec<(String, Style)>) {
+fn collect_words(
+    inlines: &[Inline],
+    style: Style,
+    palette: Palette,
+    out: &mut Vec<(String, Style)>,
+) {
     for inline in inlines {
         match inline {
             Inline::Text(text) => {
@@ -319,18 +351,23 @@ fn collect_words(inlines: &[Inline], style: Style, out: &mut Vec<(String, Style)
                     out.push((word.to_string(), style));
                 }
             }
-            Inline::Bold(inner) => collect_words(inner, style.add_modifier(Modifier::BOLD), out),
+            Inline::Bold(inner) => {
+                collect_words(inner, style.add_modifier(Modifier::BOLD), palette, out)
+            }
             Inline::Italic(inner) => {
-                collect_words(inner, style.add_modifier(Modifier::ITALIC), out)
+                collect_words(inner, style.add_modifier(Modifier::ITALIC), palette, out)
             }
-            Inline::Strikethrough(inner) => {
-                collect_words(inner, style.add_modifier(Modifier::CROSSED_OUT), out)
-            }
+            Inline::Strikethrough(inner) => collect_words(
+                inner,
+                style.add_modifier(Modifier::CROSSED_OUT),
+                palette,
+                out,
+            ),
             Inline::Link { text, .. } => {
-                collect_words(text, style.add_modifier(Modifier::UNDERLINED), out)
+                collect_words(text, style.add_modifier(Modifier::UNDERLINED), palette, out)
             }
             Inline::FootnoteReference(label) => {
-                let marker_style = style.fg(Color::Cyan).add_modifier(Modifier::BOLD);
+                let marker_style = style.patch(palette.footnote_marker_style());
                 out.push((format!("[^{label}]"), marker_style));
             }
             // Pushed as one unbreakable word so the icon never wraps away
@@ -338,7 +375,7 @@ fn collect_words(inlines: &[Inline], style: Style, out: &mut Vec<(String, Style)
             Inline::Image { alt, path } => {
                 out.push((
                     blocks::image_placeholder(alt, path),
-                    theme::image_placeholder_style(),
+                    palette.image_placeholder_style(),
                 ));
             }
         }
@@ -379,7 +416,7 @@ mod tests {
     /// Layout for a terminal that can't draw images, which is what every
     /// test that isn't about images wants.
     fn text_layout(blocks: &[Block], width: usize) -> LayoutDoc {
-        layout(blocks, width, &Sizing::text_only())
+        layout(blocks, width, &Sizing::text_only(), Palette::Dark)
     }
 
     fn text_paragraph(s: &str) -> Block {
@@ -532,9 +569,49 @@ mod tests {
         for images in [Sizing::text_only(), drawable] {
             for width in [10, 20, 80] {
                 assert_eq!(
-                    layout(&blocks, width, &images).total_rows,
-                    render_lines(&blocks, width, &images).len(),
+                    layout(&blocks, width, &images, Palette::Dark).total_rows,
+                    render_lines(&blocks, width, &images, Palette::Dark).len(),
                     "mismatch at width {width}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_palette_lays_out_the_same_rows() {
+        // --no-color and --theme change how the document looks, never
+        // where anything is: a palette that dropped a heading's rule row
+        // would move every scroll offset, TOC target and search match
+        // below it.
+        let blocks = vec![
+            Block::Heading {
+                level: 1,
+                text: vec![Inline::Text("Title".to_string())],
+            },
+            Block::Heading {
+                level: 4,
+                text: vec![Inline::Text("Deep".to_string())],
+            },
+            text_paragraph("Body text that is long enough to wrap somewhere."),
+            Block::Code {
+                lang: Some("rust".to_string()),
+                text: "fn main() {}\n".to_string(),
+            },
+            Block::Blockquote(vec![text_paragraph("quoted")]),
+            image("A picture", "square.png"),
+        ];
+
+        for width in [10, 20, 80] {
+            let dark = layout(&blocks, width, &Sizing::text_only(), Palette::Dark);
+            for palette in [Palette::Light, Palette::Plain] {
+                let other = layout(&blocks, width, &Sizing::text_only(), palette);
+                assert_eq!(
+                    other.blocks, dark.blocks,
+                    "{palette:?} moved a block at width {width}"
+                );
+                assert_eq!(
+                    other.rows, dark.rows,
+                    "{palette:?} changed the text at width {width}"
                 );
             }
         }
@@ -591,7 +668,7 @@ mod tests {
             [("square.png", (200, 200))],
         );
 
-        let doc = layout(&[image("Alt", "square.png")], 80, &sizing);
+        let doc = layout(&[image("Alt", "square.png")], 80, &sizing, Palette::Dark);
 
         assert_eq!(doc.blocks[0].row_count, 10);
         assert_eq!(
@@ -608,7 +685,7 @@ mod tests {
             [("elsewhere.png", (200, 200))],
         );
 
-        let doc = layout(&[image("Alt", "square.png")], 80, &sizing);
+        let doc = layout(&[image("Alt", "square.png")], 80, &sizing, Palette::Dark);
 
         assert_eq!(doc.blocks[0].row_count, 1);
         assert_eq!(doc.rows, vec!["\u{1f5bc} [Alt]".to_string()]);

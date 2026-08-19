@@ -3,21 +3,22 @@ use ratatui::layout::Rect;
 use ratatui::layout::Size;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block as RatBlock, Borders, List, ListItem, Paragraph};
+use ratatui::widgets::{Block as RatBlock, Borders, Clear, List, ListItem, Paragraph};
 use ratatui_image::StatefulImage;
 
-use crate::app::{App, Mode};
+use crate::app::{self, App, Focus, Mode};
 use crate::image::{Gallery, Sizing};
 use crate::markdown::blocks::{self, Block};
 use crate::markdown::layout::{self, LayoutDoc};
 use crate::search;
-use crate::theme;
+use crate::theme::Palette;
 use crate::toc::TocEntry;
 
 /// Everything one frame draws: the pager state plus the document it's
 /// looking at, already parsed, laid out, and resolved. Bundled because
-/// these six always travel together and are always built from the same
-/// width.
+/// these always travel together and are always built from the same width
+/// and the same palette.
+#[derive(Clone, Copy)]
 pub struct Screen<'a> {
     pub app: &'a App,
     pub blocks: &'a [Block],
@@ -25,6 +26,9 @@ pub struct Screen<'a> {
     pub toc: &'a [TocEntry],
     pub matches: &'a [search::Match],
     pub image_sizing: &'a Sizing,
+    /// Must be the palette the `layout_doc` was built with: they agree on
+    /// row counts only because every palette lays out identically.
+    pub palette: Palette,
 }
 
 /// Splits a frame's area into an optional TOC sidebar and the main
@@ -123,26 +127,29 @@ fn highlight_line(line: Line<'static>, start: usize, end: usize, style: Style) -
 /// `matches` is only painted onto the text when `app.search_active`, and
 /// must have been resolved against that same `LayoutDoc`.
 pub fn render(frame: &mut Frame, screen: Screen<'_>, gallery: &mut Gallery) {
+    // `layout_doc` isn't unpacked here: only `render_images` needs it,
+    // and it takes the whole `Screen`.
     let Screen {
         app,
         blocks,
-        layout_doc,
         toc,
         matches,
         image_sizing,
+        palette,
+        ..
     } = screen;
     let area = frame.area();
     let (sidebar_area, main_area) = split_areas(area, app.toc_open);
     let (content_area, status_area) = split_status(main_area, search_status_visible(app));
 
-    let mut lines = layout::render_lines(blocks, main_area.width as usize, image_sizing);
+    let mut lines = layout::render_lines(blocks, main_area.width as usize, image_sizing, palette);
     if app.search_active {
         for (i, m) in matches.iter().enumerate() {
             if let Some(line) = lines.get_mut(m.row) {
                 let style = if Some(i) == app.current_match {
-                    theme::search_current_match_style()
+                    palette.search_current_match_style()
                 } else {
-                    theme::search_match_style()
+                    palette.search_match_style()
                 };
                 *line = highlight_line(std::mem::take(line), m.start, m.end, style);
             }
@@ -159,15 +166,13 @@ pub fn render(frame: &mut Frame, screen: Screen<'_>, gallery: &mut Gallery) {
         render_toc(frame, sidebar_area, toc, app.toc_selected, app.toc_focused);
     }
 
-    render_images(
-        frame,
-        content_area,
-        app,
-        blocks,
-        layout_doc,
-        image_sizing,
-        gallery,
-    );
+    render_images(frame, content_area, screen, gallery);
+
+    // Last, so it covers the document, the sidebar and the status row
+    // alike.
+    if app.help_open {
+        render_help(frame, area, palette);
+    }
 }
 
 /// Fills the rows `layout` reserved for each image: with the picture
@@ -178,15 +183,15 @@ pub fn render(frame: &mut Frame, screen: Screen<'_>, gallery: &mut Gallery) {
 /// re-fitting a picture on every scroll tick would cost a decode per
 /// keystroke — but it can't be left blank either, so the reader sees the
 /// same placeholder the untouchable tiers show.
-fn render_images(
-    frame: &mut Frame,
-    content_area: Rect,
-    app: &App,
-    blocks: &[Block],
-    layout_doc: &LayoutDoc,
-    images: &Sizing,
-    gallery: &mut Gallery,
-) {
+fn render_images(frame: &mut Frame, content_area: Rect, screen: Screen<'_>, gallery: &mut Gallery) {
+    let Screen {
+        app,
+        blocks,
+        layout_doc,
+        image_sizing: images,
+        palette,
+        ..
+    } = screen;
     let viewport = app.scroll..app.scroll + content_area.height as usize;
 
     for laid_out in &layout_doc.blocks {
@@ -201,7 +206,12 @@ fn render_images(
             continue;
         }
 
-        let fully_visible = laid_out.row_start >= viewport.start && last_row <= viewport.end;
+        // The overlay is drawn after this, and a picture painted by the
+        // terminal's own graphics protocol would sit on top of it rather
+        // than under it — so while help is up, every image falls back to
+        // the placeholder the untouchable tiers already show.
+        let fully_visible =
+            laid_out.row_start >= viewport.start && last_row <= viewport.end && !app.help_open;
         let top = laid_out.row_start.max(viewport.start);
         let area = Rect {
             x: content_area.x,
@@ -235,13 +245,77 @@ fn render_images(
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 blocks::image_placeholder(alt, path),
-                theme::image_placeholder_style(),
+                palette.image_placeholder_style(),
             ))),
             Rect {
                 width: content_area.width,
                 ..area
             },
         );
+    }
+}
+
+/// Draws the keybinding overlay over everything else, sized to its own
+/// content and centred.
+///
+/// Built from `app::KEYBINDINGS`, which is also what `handle_key` is
+/// checked against, so the overlay can't promise a key the app doesn't
+/// honour.
+fn render_help(frame: &mut Frame, area: Rect, palette: Palette) {
+    let key_width = app::KEYBINDINGS
+        .iter()
+        .map(|binding| binding.keys.chars().count())
+        .max()
+        .unwrap_or(0);
+    let title_style = palette.heading_style(2).style;
+    let key_style = Style::new().add_modifier(Modifier::BOLD);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (focus, title) in [
+        (Focus::Pager, "Document"),
+        (Focus::Outline, "Outline"),
+        (Focus::Search, "While searching"),
+    ] {
+        if !lines.is_empty() {
+            lines.push(Line::default());
+        }
+        lines.push(Line::from(Span::styled(title, title_style)));
+        for binding in app::KEYBINDINGS.iter().filter(|b| b.focus == focus) {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {:key_width$}  ", binding.keys), key_style),
+                Span::raw(binding.description),
+            ]));
+        }
+    }
+
+    let content_width = lines
+        .iter()
+        .map(|line| line.spans.iter().map(|s| s.content.chars().count()).sum())
+        .max()
+        .unwrap_or(0) as u16;
+    // Plus borders on both sides, and a column of breathing room inside.
+    let popup = centered(area, content_width + 4, lines.len() as u16 + 2);
+
+    let block = RatBlock::new()
+        .borders(Borders::ALL)
+        .title("Keys")
+        .padding(ratatui::widgets::Padding::horizontal(1));
+    // Erases the document underneath, so the overlay isn't read as part
+    // of the text it's covering.
+    frame.render_widget(Clear, popup);
+    frame.render_widget(Paragraph::new(Text::from(lines)).block(block), popup);
+}
+
+/// The largest `width` x `height` rectangle that fits inside `area`,
+/// centred on it.
+fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
     }
 }
 
@@ -319,9 +393,21 @@ mod tests {
         toc: &[TocEntry],
         matches: &[search::Match],
     ) {
+        text_render_with(frame, app, blocks, toc, matches, Palette::Dark);
+    }
+
+    /// As `text_render`, for the tests that are about the palette itself.
+    fn text_render_with(
+        frame: &mut Frame,
+        app: &App,
+        blocks: &[Block],
+        toc: &[TocEntry],
+        matches: &[search::Match],
+        palette: Palette,
+    ) {
         let images = Sizing::text_only();
         let (_, main_area) = split_areas(frame.area(), app.toc_open);
-        let layout_doc = layout::layout(blocks, main_area.width as usize, &images);
+        let layout_doc = layout::layout(blocks, main_area.width as usize, &images, palette);
         render(
             frame,
             Screen {
@@ -331,6 +417,7 @@ mod tests {
                 toc,
                 matches,
                 image_sizing: &images,
+                palette,
             },
             &mut Gallery::disabled(),
         );
@@ -409,7 +496,7 @@ mod tests {
     fn highlight_line_patches_style_onto_the_matched_range_and_preserves_the_rest() {
         let line = Line::from(Span::raw("the quick brown fox"));
 
-        let highlighted = highlight_line(line, 4, 9, crate::theme::search_match_style());
+        let highlighted = highlight_line(line, 4, 9, Palette::Dark.search_match_style());
 
         let plain: String = highlighted
             .spans
@@ -425,7 +512,7 @@ mod tests {
             .iter()
             .find(|s| s.content.as_ref() == "quick")
             .expect("the matched substring should be its own span");
-        assert_eq!(matched.style, crate::theme::search_match_style());
+        assert_eq!(matched.style, Palette::Dark.search_match_style());
     }
 
     #[test]
@@ -435,7 +522,7 @@ mod tests {
         let bold_style = Style::new().add_modifier(Modifier::BOLD);
         let line = Line::from(vec![Span::styled("bold", bold_style), Span::raw(" text")]);
 
-        let highlighted = highlight_line(line, 2, 7, crate::theme::search_match_style());
+        let highlighted = highlight_line(line, 2, 7, Palette::Dark.search_match_style());
 
         let plain: String = highlighted
             .spans
@@ -444,7 +531,7 @@ mod tests {
             .collect();
         assert_eq!(plain, "bold text");
 
-        let highlight_style = crate::theme::search_match_style();
+        let highlight_style = Palette::Dark.search_match_style();
         let highlighted_text: String = highlighted
             .spans
             .iter()
@@ -461,7 +548,12 @@ mod tests {
     fn confirmed_search_highlights_the_current_match_distinctly_from_other_matches() {
         let source = "fox fox fox";
         let blocks = crate::markdown::blocks::lower(source);
-        let layout_doc = layout::layout(&blocks, 80, &crate::image::Sizing::text_only());
+        let layout_doc = layout::layout(
+            &blocks,
+            80,
+            &crate::image::Sizing::text_only(),
+            Palette::Dark,
+        );
         let matches = crate::search::search("fox", &layout_doc);
         assert_eq!(matches.len(), 3);
 
@@ -533,6 +625,7 @@ mod tests {
             &blocks,
             main_area.width as usize,
             &crate::image::Sizing::text_only(),
+            Palette::Dark,
         );
         let toc = crate::toc::resolve(&headings, &layout_doc);
         let target_row = toc[0].row;
@@ -576,6 +669,7 @@ mod tests {
             &blocks,
             main_area.width as usize,
             &crate::image::Sizing::text_only(),
+            Palette::Dark,
         );
         let toc = crate::toc::resolve(&headings, &layout_doc);
 
@@ -784,7 +878,12 @@ mod tests {
         app.apply_reselection(search::Reselection::FellBackToFirst);
         let matches = search::search(
             "fox",
-            &layout::layout(&blocks, 60, &crate::image::Sizing::text_only()),
+            &layout::layout(
+                &blocks,
+                60,
+                &crate::image::Sizing::text_only(),
+                Palette::Dark,
+            ),
         );
 
         let backend = TestBackend::new(60, 4);
@@ -906,6 +1005,7 @@ mod tests {
                         toc: &[],
                         matches: &[],
                         image_sizing: images,
+                        palette: Palette::Dark,
                     },
                     gallery,
                 )
@@ -950,7 +1050,7 @@ mod tests {
     #[test]
     fn a_drawable_image_is_painted_into_the_rows_reserved_for_it() {
         let (dir, blocks, images) = image_fixture("ui-image", "![Alt](red.png)");
-        let layout_doc = layout::layout(&blocks, 20, &images);
+        let layout_doc = layout::layout(&blocks, 20, &images, Palette::Dark);
         let (mut gallery, jobs) = crate::image::test_gallery();
         let mut app = App::new(layout_doc.total_rows);
         app.viewport_height = 5;
@@ -979,7 +1079,7 @@ mod tests {
     #[test]
     fn an_image_shows_its_placeholder_until_the_worker_answers() {
         let (dir, blocks, images) = image_fixture("ui-image-pending", "![Alt](red.png)");
-        let layout_doc = layout::layout(&blocks, 20, &images);
+        let layout_doc = layout::layout(&blocks, 20, &images, Palette::Dark);
         let (mut gallery, jobs) = crate::image::test_gallery();
         let mut app = App::new(layout_doc.total_rows);
         app.viewport_height = 5;
@@ -1023,7 +1123,7 @@ mod tests {
     #[test]
     fn text_after_an_image_starts_below_the_rows_the_picture_reserved() {
         let (dir, blocks, images) = image_fixture("ui-image-after", "![Alt](red.png)\n\nAfter it.");
-        let layout_doc = layout::layout(&blocks, 20, &images);
+        let layout_doc = layout::layout(&blocks, 20, &images, Palette::Dark);
         let (mut gallery, jobs) = crate::image::test_gallery();
         let mut app = App::new(layout_doc.total_rows);
         app.viewport_height = 5;
@@ -1054,7 +1154,7 @@ mod tests {
     fn an_image_scrolled_half_off_screen_goes_back_to_its_placeholder() {
         let (dir, blocks, images) =
             image_fixture("ui-image-partial", "Above.\n\n![Alt](red.png)\n\nAfter it.");
-        let layout_doc = layout::layout(&blocks, 20, &images);
+        let layout_doc = layout::layout(&blocks, 20, &images, Palette::Dark);
         let (mut gallery, jobs) = crate::image::test_gallery();
         let mut app = App::new(layout_doc.total_rows);
         // Rows are "Above." 0, picture 1-2, "After it." 3.
@@ -1101,7 +1201,7 @@ mod tests {
     #[test]
     fn an_image_still_being_encoded_keeps_its_placeholder_rather_than_a_gap() {
         let (dir, blocks, images) = image_fixture("ui-image-encoding", "![Alt](red.png)");
-        let layout_doc = layout::layout(&blocks, 20, &images);
+        let layout_doc = layout::layout(&blocks, 20, &images, Palette::Dark);
         let (mut gallery, jobs) = crate::image::test_gallery();
         let mut app = App::new(layout_doc.total_rows);
         app.viewport_height = 5;
@@ -1134,5 +1234,177 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The style the frame actually gave one cell, rebuilt from the cell
+    /// itself — what the terminal would emit, not what the code intended.
+    fn cell_style(cell: &ratatui::buffer::Cell) -> Style {
+        Style::new()
+            .fg(cell.fg)
+            .bg(cell.bg)
+            .add_modifier(cell.modifier)
+    }
+
+    fn draw_with(app: &App, blocks: &[Block], palette: Palette) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(30, 6)).unwrap();
+        terminal
+            .draw(|frame| text_render_with(frame, app, blocks, &[], &[], palette))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn a_heading_is_painted_in_whichever_palette_the_screen_carries() {
+        let blocks = crate::markdown::blocks::lower("# Title");
+        let app = App::new(0);
+
+        let colour_of =
+            |palette| cell_style(draw_with(&app, &blocks, palette).cell((0, 0)).unwrap()).fg;
+
+        assert_eq!(colour_of(Palette::Dark), Some(Color::Magenta));
+        assert_eq!(colour_of(Palette::Light), Some(Color::Blue));
+        assert_eq!(
+            colour_of(Palette::Plain),
+            Some(Color::Reset),
+            "--no-color left a foreground colour on a heading"
+        );
+    }
+
+    #[test]
+    fn without_colour_a_heading_is_still_bold_and_still_keeps_its_rule_row() {
+        let blocks = crate::markdown::blocks::lower("# Title");
+        let app = App::new(0);
+        let buffer = draw_with(&app, &blocks, Palette::Plain);
+
+        assert!(
+            cell_style(buffer.cell((0, 0)).unwrap())
+                .add_modifier
+                .contains(Modifier::BOLD),
+            "bold is all a colourless heading has left"
+        );
+        assert_eq!(
+            buffer.cell((0, 1)).unwrap().symbol(),
+            "\u{2500}",
+            "the rule row under the heading has to survive --no-color"
+        );
+    }
+
+    #[test]
+    fn without_colour_the_selected_search_match_still_stands_out() {
+        let blocks = crate::markdown::blocks::lower("alpha beta alpha");
+        let mut app = App::new(0);
+        app.search_active = true;
+        app.search_query = "alpha".to_string();
+        app.current_match = Some(0);
+
+        let images = Sizing::text_only();
+        let layout_doc = layout::layout(&blocks, 30, &images, Palette::Plain);
+        let matches = search::search("alpha", &layout_doc);
+        assert_eq!(matches.len(), 2);
+
+        let mut terminal = Terminal::new(TestBackend::new(30, 3)).unwrap();
+        terminal
+            .draw(|frame| text_render_with(frame, &app, &blocks, &[], &matches, Palette::Plain))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let selected = buffer.cell((0, 0)).unwrap();
+        let other = buffer.cell((matches[1].start as u16, 0)).unwrap();
+        assert_eq!(selected.fg, Color::Reset, "--no-color coloured a match");
+        assert_eq!(other.fg, Color::Reset, "--no-color coloured a match");
+        assert!(
+            selected.modifier.contains(Modifier::REVERSED)
+                && other.modifier.contains(Modifier::REVERSED),
+            "matches need reverse video once colour is gone"
+        );
+        assert_ne!(
+            selected.modifier, other.modifier,
+            "the selected match must still be distinguishable from the rest"
+        );
+    }
+
+    #[test]
+    fn the_help_overlay_lists_every_binding_over_the_document() {
+        let blocks = crate::markdown::blocks::lower("body text");
+        let mut app = App::new(0);
+        app.help_open = true;
+
+        // 80 columns: the overlay has to fit the classic terminal width
+        // without clipping a description.
+        let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        terminal
+            .draw(|frame| text_render(frame, &app, &blocks, &[], &[]))
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        for binding in crate::app::KEYBINDINGS {
+            assert!(
+                screen.contains(binding.keys),
+                "the overlay left out {:?}",
+                binding.keys
+            );
+            assert!(
+                screen.contains(binding.description),
+                "the overlay left out {:?}",
+                binding.description
+            );
+        }
+        assert!(screen.contains("Keys"), "the overlay has no title");
+    }
+
+    #[test]
+    fn the_document_is_back_once_the_overlay_closes() {
+        // Long enough that the middle of the screen — where the overlay
+        // is centred — has document text on it to be covered.
+        let source: String = (0..25)
+            .map(|i| {
+                format!(
+                    "paragraph{i}
+
+"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        let blocks = crate::markdown::blocks::lower(&source);
+        let mut app = App::new(0);
+        app.help_open = true;
+
+        let mut terminal = Terminal::new(TestBackend::new(70, 30)).unwrap();
+        terminal
+            .draw(|frame| text_render(frame, &app, &blocks, &[], &[]))
+            .unwrap();
+        assert!(
+            !row_text(terminal.backend().buffer(), 15, 70).contains("paragraph"),
+            "the overlay should be covering the document"
+        );
+
+        app.help_open = false;
+        terminal
+            .draw(|frame| text_render(frame, &app, &blocks, &[], &[]))
+            .unwrap();
+        assert!(
+            row_text(terminal.backend().buffer(), 15, 70).contains("paragraph"),
+            "the document should be uncovered again"
+        );
+    }
+
+    #[test]
+    fn an_overlay_larger_than_the_terminal_is_clipped_not_panicked_on() {
+        let blocks = crate::markdown::blocks::lower("body text");
+        let mut app = App::new(0);
+        app.help_open = true;
+
+        // Smaller than the overlay wants to be in both directions.
+        let mut terminal = Terminal::new(TestBackend::new(12, 4)).unwrap();
+        terminal
+            .draw(|frame| text_render(frame, &app, &blocks, &[], &[]))
+            .unwrap();
     }
 }

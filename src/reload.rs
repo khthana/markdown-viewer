@@ -1,6 +1,6 @@
+use std::io::ErrorKind;
 use std::path::Path;
 
-use anyhow::Context;
 use ratatui_image::FontSize;
 
 use crate::app::{self, App};
@@ -8,6 +8,7 @@ use crate::image::{Gallery, Sizing};
 use crate::markdown::blocks::{self, Block, HeadingRef};
 use crate::markdown::layout::{self, LayoutDoc};
 use crate::search;
+use crate::theme::Palette;
 use crate::toc::{self, TocEntry};
 
 /// What the user's scroll position was pinned to when a reload started.
@@ -46,8 +47,10 @@ pub struct Document {
 /// `font` — the terminal's cell size, or `None` on a terminal that can't
 /// draw them, where every image stays an alt-text placeholder.
 pub fn load(path: &Path, font: Option<FontSize>) -> anyhow::Result<Document> {
+    // The same wording the startup check uses, so a file that goes
+    // missing later reads the same as one that never existed.
     let content = std::fs::read_to_string(path)
-        .with_context(|| format!("could not read file: {}", path.display()))?;
+        .map_err(|error| anyhow::anyhow!(describe_failure(path, &error)))?;
     let (blocks, headings) = blocks::lower_with_headings(&content);
     let images = match font {
         // Image paths are written relative to the document, not to
@@ -66,6 +69,40 @@ pub fn load(path: &Path, font: Option<FontSize>) -> anyhow::Result<Document> {
     })
 }
 
+/// Checks the file can actually be read, before the caller enters the
+/// alternate screen.
+///
+/// Doing it up front is what makes a bad path print one plain line
+/// instead of flashing an empty pager and erroring out behind it.
+pub fn check_readable(path: &Path) -> anyhow::Result<()> {
+    // Checked before opening because Windows reports opening a directory
+    // as a permission error, which would be a confusing thing to tell the
+    // reader.
+    let failure = if path.is_dir() {
+        std::io::Error::from(ErrorKind::IsADirectory)
+    } else {
+        match std::fs::File::open(path) {
+            Ok(_) => return Ok(()),
+            Err(error) => error,
+        }
+    };
+    Err(anyhow::anyhow!(describe_failure(path, &failure)))
+}
+
+/// Says what went wrong in the reader's terms rather than Rust's: they
+/// get "no such file: notes.md", not an `os error 2` dump.
+fn describe_failure(path: &Path, error: &std::io::Error) -> String {
+    let path = path.display();
+    match error.kind() {
+        ErrorKind::NotFound => format!("no such file: {path}"),
+        ErrorKind::PermissionDenied => format!("permission denied: {path}"),
+        ErrorKind::IsADirectory => format!("{path} is a directory, not a file"),
+        // Anything rarer still names the file first, so the reader knows
+        // which one failed even when the rest is the OS talking.
+        _ => format!("could not read {path}: {error}"),
+    }
+}
+
 /// Re-reads the file and swaps in the new document, moving `app`'s scroll
 /// position to wherever the old document's anchor now lives and, when a
 /// search is active, re-running the query and re-selecting the equivalent
@@ -80,6 +117,7 @@ pub fn reload_preserving_position(
     app: &mut App,
     layout_doc: &LayoutDoc,
     width: usize,
+    palette: Palette,
     gallery: &mut Gallery,
 ) {
     let anchor = compute_anchor(&document.headings, layout_doc, app.scroll);
@@ -91,7 +129,7 @@ pub fn reload_preserving_position(
     // a different picture now.
     gallery.forget_all();
 
-    let new_layout = layout::layout(&fresh.blocks, width, &fresh.image_sizing);
+    let new_layout = layout::layout(&fresh.blocks, width, &fresh.image_sizing, palette);
     app.total_rows = new_layout.total_rows;
     app.scroll = resolve_anchor(&anchor, &fresh.headings, &new_layout, app.viewport_height);
     // The scroll position stays where the document anchor put it: the
@@ -219,7 +257,12 @@ mod tests {
 
     fn doc(source: &str) -> Doc {
         let (blocks, headings) = lower_with_headings(source);
-        let layout = layout::layout(&blocks, WIDTH, &crate::image::Sizing::text_only());
+        let layout = layout::layout(
+            &blocks,
+            WIDTH,
+            &crate::image::Sizing::text_only(),
+            Palette::Dark,
+        );
         Doc { headings, layout }
     }
 
@@ -429,8 +472,12 @@ Body.");
         std::fs::write(&path, "# Title\n\nIntro.\n\n## Section\n\nBody text.").unwrap();
 
         let mut document = load(&path, None).unwrap();
-        let layout_doc =
-            layout::layout(&document.blocks, WIDTH, &crate::image::Sizing::text_only());
+        let layout_doc = layout::layout(
+            &document.blocks,
+            WIDTH,
+            &crate::image::Sizing::text_only(),
+            Palette::Dark,
+        );
         let mut app = App::new(layout_doc.total_rows);
         app.viewport_height = VIEWPORT;
         app.scroll = 3; // the row "## Section" starts on
@@ -446,6 +493,7 @@ Body.");
             &mut app,
             &layout_doc,
             WIDTH,
+            Palette::Dark,
             &mut Gallery::disabled(),
         );
 
@@ -463,8 +511,12 @@ Body.");
         std::fs::write(&path, "# Title\n\nIntro.\n\n## Section\n\nBody text.").unwrap();
 
         let mut document = load(&path, None).unwrap();
-        let layout_doc =
-            layout::layout(&document.blocks, WIDTH, &crate::image::Sizing::text_only());
+        let layout_doc = layout::layout(
+            &document.blocks,
+            WIDTH,
+            &crate::image::Sizing::text_only(),
+            Palette::Dark,
+        );
         let mut app = App::new(layout_doc.total_rows);
         app.viewport_height = VIEWPORT;
         app.scroll = 3;
@@ -478,6 +530,7 @@ Body.");
             &mut app,
             &layout_doc,
             WIDTH,
+            Palette::Dark,
             &mut Gallery::disabled(),
         );
 
@@ -505,8 +558,12 @@ Body.");
             std::fs::write(&path, source).unwrap();
 
             let document = load(&path, None).unwrap();
-            let layout =
-                layout::layout(&document.blocks, WIDTH, &crate::image::Sizing::text_only());
+            let layout = layout::layout(
+                &document.blocks,
+                WIDTH,
+                &crate::image::Sizing::text_only(),
+                Palette::Dark,
+            );
             let mut app = App::new(layout.total_rows);
             app.viewport_height = VIEWPORT;
             app.search_query = query.to_string();
@@ -531,6 +588,7 @@ Body.");
                 &mut self.app,
                 &self.layout,
                 WIDTH,
+                Palette::Dark,
                 &mut Gallery::disabled(),
             );
         }
@@ -595,5 +653,70 @@ Body.");
             !session.app.search_fell_back,
             "there was no earlier match to lose"
         );
+    }
+
+    #[test]
+    fn a_missing_file_is_reported_by_name_without_an_os_error_dump() {
+        let missing = std::env::temp_dir().join("mdview-does-not-exist-9f3a.md");
+
+        let message = check_readable(&missing)
+            .expect_err("a missing file must not be readable")
+            .to_string();
+
+        assert!(
+            message.contains("no such file"),
+            "unhelpful message: {message}"
+        );
+        assert!(
+            message.contains("mdview-does-not-exist-9f3a.md"),
+            "the message doesn't say which file: {message}"
+        );
+        assert!(
+            !message.contains("os error"),
+            "the raw OS error leaked through: {message}"
+        );
+    }
+
+    #[test]
+    fn a_directory_is_reported_as_a_directory_rather_than_a_permissions_problem() {
+        let message = check_readable(&std::env::temp_dir())
+            .expect_err("a directory isn't a markdown file")
+            .to_string();
+
+        assert!(
+            message.contains("is a directory"),
+            "unhelpful message: {message}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_file_names_the_permission_problem() {
+        let path = Path::new("locked.md");
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+
+        let message = describe_failure(path, &denied);
+
+        assert_eq!(message, "permission denied: locked.md");
+    }
+
+    #[test]
+    fn an_unexpected_failure_still_names_the_file_first() {
+        let path = Path::new("odd.md");
+        let broken = std::io::Error::from(std::io::ErrorKind::InvalidData);
+
+        let message = describe_failure(path, &broken);
+
+        assert!(message.starts_with("could not read odd.md"), "{message}");
+    }
+
+    #[test]
+    fn a_readable_file_passes_the_check() {
+        let dir = scratch_dir("readable");
+        let file = dir.join("doc.md");
+        std::fs::write(&file, "# hi").unwrap();
+
+        assert!(check_readable(&file).is_ok());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

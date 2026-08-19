@@ -24,6 +24,9 @@ pub struct AppState {
     pub pending_g: bool,
     pub toc_focused: bool,
     pub mode: Mode,
+    /// While the help overlay is up it swallows every key, so nothing
+    /// else in this struct matters until it's dismissed.
+    pub help_open: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +51,8 @@ pub enum Action {
     NextMatch,
     PrevMatch,
     Reload,
+    OpenHelp,
+    CloseHelp,
 }
 
 impl Action {
@@ -65,6 +70,180 @@ impl Action {
     }
 }
 
+/// Which focus a binding applies in — the same key means different
+/// things depending on what has the keyboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    /// The document pane, which is where most keys act.
+    Pager,
+    /// The outline sidebar, once `Tab` has focused it.
+    Outline,
+    /// Typing a search query.
+    Search,
+}
+
+/// One row of the help overlay.
+///
+/// `checks` is what keeps the overlay honest: every key the row
+/// advertises, paired with the action it must produce. Two tests hold the
+/// table and `handle_key` to each other — one that every advertised key
+/// does what it says, and one that every key the app honours is
+/// advertised — so neither can drift from the other.
+#[derive(Debug, Clone, Copy)]
+pub struct Binding {
+    pub keys: &'static str,
+    pub description: &'static str,
+    pub focus: Focus,
+    /// Read only by those tests: a table can't be the dispatch itself,
+    /// since `handle_key` also has to answer key sequences (`gg`) and
+    /// free text, which don't fit one key to one action.
+    #[cfg_attr(not(test), allow(dead_code))]
+    checks: &'static [(KeyCode, KeyModifiers, Action)],
+}
+
+/// Every key the app honours, in the order the help overlay lists them.
+/// The single source of truth for `?`, so what the overlay promises and
+/// what the keys do can't drift apart.
+pub const KEYBINDINGS: &[Binding] = &[
+    Binding {
+        keys: "j / Down",
+        description: "Scroll down one line",
+        focus: Focus::Pager,
+        checks: &[
+            (KeyCode::Char('j'), KeyModifiers::NONE, Action::LineDown),
+            (KeyCode::Down, KeyModifiers::NONE, Action::LineDown),
+        ],
+    },
+    Binding {
+        keys: "k / Up",
+        description: "Scroll up one line",
+        focus: Focus::Pager,
+        checks: &[
+            (KeyCode::Char('k'), KeyModifiers::NONE, Action::LineUp),
+            (KeyCode::Up, KeyModifiers::NONE, Action::LineUp),
+        ],
+    },
+    Binding {
+        keys: "Space / PgDn / Ctrl-d",
+        description: "Page down",
+        focus: Focus::Pager,
+        checks: &[
+            (KeyCode::Char(' '), KeyModifiers::NONE, Action::PageDown),
+            (KeyCode::PageDown, KeyModifiers::NONE, Action::PageDown),
+            (KeyCode::Char('d'), KeyModifiers::CONTROL, Action::PageDown),
+        ],
+    },
+    Binding {
+        keys: "Ctrl-u / PgUp",
+        description: "Half a page up",
+        focus: Focus::Pager,
+        checks: &[
+            (
+                KeyCode::Char('u'),
+                KeyModifiers::CONTROL,
+                Action::HalfPageUp,
+            ),
+            (KeyCode::PageUp, KeyModifiers::NONE, Action::HalfPageUp),
+        ],
+    },
+    Binding {
+        keys: "gg / Home",
+        description: "Jump to the top",
+        focus: Focus::Pager,
+        checks: &[(KeyCode::Home, KeyModifiers::NONE, Action::Top)],
+    },
+    Binding {
+        keys: "G / End",
+        description: "Jump to the bottom",
+        focus: Focus::Pager,
+        checks: &[
+            (KeyCode::Char('G'), KeyModifiers::NONE, Action::Bottom),
+            (KeyCode::End, KeyModifiers::NONE, Action::Bottom),
+        ],
+    },
+    Binding {
+        keys: "Tab",
+        description: "Open the outline, or close it once focused",
+        focus: Focus::Pager,
+        checks: &[(KeyCode::Tab, KeyModifiers::NONE, Action::ToggleToc)],
+    },
+    Binding {
+        keys: "j / k / Up / Down",
+        description: "Move through the outline",
+        focus: Focus::Outline,
+        checks: &[
+            (KeyCode::Char('j'), KeyModifiers::NONE, Action::TocDown),
+            (KeyCode::Char('k'), KeyModifiers::NONE, Action::TocUp),
+            (KeyCode::Down, KeyModifiers::NONE, Action::TocDown),
+            (KeyCode::Up, KeyModifiers::NONE, Action::TocUp),
+        ],
+    },
+    Binding {
+        keys: "Enter",
+        description: "Jump to the selected heading",
+        focus: Focus::Outline,
+        checks: &[(KeyCode::Enter, KeyModifiers::NONE, Action::TocJump)],
+    },
+    Binding {
+        keys: "/",
+        description: "Search the document",
+        focus: Focus::Pager,
+        checks: &[(KeyCode::Char('/'), KeyModifiers::NONE, Action::EnterSearch)],
+    },
+    Binding {
+        keys: "Enter",
+        description: "Run the query typed so far",
+        focus: Focus::Search,
+        checks: &[(KeyCode::Enter, KeyModifiers::NONE, Action::ConfirmSearch)],
+    },
+    Binding {
+        keys: "Backspace",
+        description: "Delete the last character typed",
+        focus: Focus::Search,
+        checks: &[(
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+            Action::SearchBackspace,
+        )],
+    },
+    Binding {
+        keys: "Esc",
+        description: "Abandon the search",
+        focus: Focus::Search,
+        checks: &[(KeyCode::Esc, KeyModifiers::NONE, Action::ExitSearch)],
+    },
+    Binding {
+        keys: "n / N",
+        description: "Next / previous match",
+        focus: Focus::Pager,
+        checks: &[
+            (KeyCode::Char('n'), KeyModifiers::NONE, Action::NextMatch),
+            (KeyCode::Char('N'), KeyModifiers::NONE, Action::PrevMatch),
+        ],
+    },
+    Binding {
+        keys: "r",
+        description: "Reload the file now",
+        focus: Focus::Pager,
+        checks: &[(KeyCode::Char('r'), KeyModifiers::NONE, Action::Reload)],
+    },
+    Binding {
+        keys: "?",
+        description: "Show this help; any key closes it",
+        focus: Focus::Pager,
+        checks: &[(KeyCode::Char('?'), KeyModifiers::NONE, Action::OpenHelp)],
+    },
+    Binding {
+        keys: "q / Ctrl-c",
+        description: "Quit",
+        focus: Focus::Pager,
+        checks: &[
+            (KeyCode::Char('q'), KeyModifiers::NONE, Action::Quit),
+            (KeyCode::Char('c'), KeyModifiers::CONTROL, Action::Quit),
+        ],
+    },
+];
+
 /// Pure decision function: given the current state and a keypress, what
 /// action should the app take? Contains no side effects, so it's testable
 /// without a terminal.
@@ -74,6 +253,12 @@ pub fn handle_key(state: &AppState, key: KeyEvent) -> Action {
     // Ctrl-C is a universal escape hatch, even mid-search.
     if key.code == KeyCode::Char('c') && ctrl {
         return Action::Quit;
+    }
+
+    // The overlay covers the document, so the next key is the reader
+    // asking for the document back — whichever key it happens to be.
+    if state.help_open {
+        return Action::CloseHelp;
     }
 
     // While typing a search query, almost every key is text input rather
@@ -89,11 +274,12 @@ pub fn handle_key(state: &AppState, key: KeyEvent) -> Action {
         };
     }
 
-    // Tab, quit, and reload are global, regardless of TOC focus.
+    // Tab, quit, reload and help are global, regardless of TOC focus.
     match key.code {
         KeyCode::Tab => return Action::ToggleToc,
         KeyCode::Char('q') => return Action::Quit,
         KeyCode::Char('r') => return Action::Reload,
+        KeyCode::Char('?') => return Action::OpenHelp,
         _ => {}
     }
 
@@ -106,6 +292,8 @@ pub fn handle_key(state: &AppState, key: KeyEvent) -> Action {
         };
     }
 
+    // Matched on the key alone: a terminal reports `G` and `N` as
+    // SHIFT-modified, so insisting on no modifiers would break them.
     match key.code {
         KeyCode::Char('j') | KeyCode::Down => Action::LineDown,
         KeyCode::Char('k') | KeyCode::Up => Action::LineUp,
@@ -152,6 +340,8 @@ pub enum KeyOutcome {
 /// rendered document.
 pub struct App {
     pub scroll: usize,
+    /// Whether the keybinding overlay is covering the document.
+    pub help_open: bool,
     pub viewport_height: usize,
     pub total_rows: usize,
     pub toc_open: bool,
@@ -175,6 +365,7 @@ impl App {
     pub fn new(total_rows: usize) -> Self {
         Self {
             scroll: 0,
+            help_open: false,
             viewport_height: 0,
             total_rows,
             toc_open: false,
@@ -230,6 +421,7 @@ impl App {
             pending_g: self.pending_g,
             toc_focused: self.toc_focused,
             mode: self.mode,
+            help_open: self.help_open,
         };
         let action = handle_key(&state, key);
         self.pending_g = matches!(key.code, KeyCode::Char('g')) && !self.pending_g;
@@ -250,6 +442,8 @@ impl App {
             }
             Action::Top => self.scroll = 0,
             Action::Bottom => self.scroll = self.max_scroll(),
+            Action::OpenHelp => self.help_open = true,
+            Action::CloseHelp => self.help_open = false,
             Action::Quit => return KeyOutcome::Quit,
             Action::Reload => return KeyOutcome::Reload,
             // Closed -> open+focused; open+focused -> closed; open+unfocused
@@ -337,6 +531,7 @@ mod tests {
             pending_g,
             toc_focused: false,
             mode: Mode::Normal,
+            help_open: false,
         }
     }
 
@@ -451,6 +646,7 @@ mod tests {
             pending_g: false,
             toc_focused: true,
             mode: Mode::Normal,
+            help_open: false,
         };
         assert_eq!(handle_key(&focused, key(KeyCode::Tab)), Action::ToggleToc);
     }
@@ -468,6 +664,7 @@ mod tests {
             pending_g: false,
             toc_focused: false,
             mode: Mode::Search,
+            help_open: false,
         }
     }
 
@@ -531,6 +728,7 @@ mod tests {
             pending_g: false,
             toc_focused: true,
             mode: Mode::Normal,
+            help_open: false,
         };
         assert_eq!(handle_key(&focused, key(KeyCode::Up)), Action::TocUp);
         assert_eq!(handle_key(&focused, key(KeyCode::Down)), Action::TocDown);
@@ -783,6 +981,7 @@ mod tests {
             pending_g: false,
             toc_focused: false,
             mode: Mode::Search,
+            help_open: false,
         };
         assert_eq!(
             handle_key(&searching, key(KeyCode::Char('r'))),
@@ -796,6 +995,7 @@ mod tests {
             pending_g: false,
             toc_focused: true,
             mode: Mode::Normal,
+            help_open: false,
         };
         assert_eq!(
             handle_key(&focused, key(KeyCode::Char('r'))),
@@ -865,5 +1065,149 @@ mod tests {
 
         assert_eq!(app.current_match, Some(0));
         assert!(!app.search_fell_back);
+    }
+
+    #[test]
+    fn question_mark_opens_the_help_overlay_and_the_next_key_closes_it() {
+        let mut app = App::new(100);
+        app.viewport_height = 10;
+
+        app.on_key(key(KeyCode::Char('?')), &[], &[]);
+        assert!(app.help_open);
+
+        // A key that would normally scroll: while the overlay is up it
+        // only dismisses it, so the reader can't lose their place by
+        // pressing something to get rid of it.
+        app.on_key(key(KeyCode::Char('j')), &[], &[]);
+        assert!(!app.help_open);
+        assert_eq!(app.scroll, 0, "the dismissing key also scrolled");
+    }
+
+    #[test]
+    fn ctrl_c_still_quits_from_under_the_help_overlay() {
+        let mut app = App::new(100);
+        app.on_key(key(KeyCode::Char('?')), &[], &[]);
+
+        let outcome = app.on_key(ctrl_key(KeyCode::Char('c')), &[], &[]);
+
+        assert_eq!(outcome, KeyOutcome::Quit);
+    }
+
+    #[test]
+    fn the_help_overlay_swallows_reload_and_quit_too() {
+        let mut app = App::new(100);
+        app.on_key(key(KeyCode::Char('?')), &[], &[]);
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('q')), &[], &[]),
+            KeyOutcome::Continue
+        );
+        assert!(!app.help_open);
+
+        app.on_key(key(KeyCode::Char('?')), &[], &[]);
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('r')), &[], &[]),
+            KeyOutcome::Continue
+        );
+    }
+
+    #[test]
+    fn a_query_containing_a_question_mark_is_typed_not_treated_as_help() {
+        let mut app = App::new(100);
+        app.on_key(key(KeyCode::Char('/')), &[], &[]);
+        app.on_key(key(KeyCode::Char('?')), &[], &[]);
+
+        assert!(!app.help_open);
+        assert_eq!(app.search_query, "?");
+    }
+
+    /// The state a binding's focus describes.
+    fn focus_state(focus: Focus) -> AppState {
+        AppState {
+            pending_g: false,
+            toc_focused: focus == Focus::Outline,
+            mode: match focus {
+                Focus::Search => Mode::Search,
+                _ => Mode::Normal,
+            },
+            help_open: false,
+        }
+    }
+
+    #[test]
+    fn every_advertised_keybinding_is_one_the_app_actually_honours() {
+        for binding in KEYBINDINGS {
+            let state = focus_state(binding.focus);
+            for (code, modifiers, action) in binding.checks {
+                assert_eq!(
+                    handle_key(&state, KeyEvent::new(*code, *modifiers)),
+                    *action,
+                    "the overlay promises {:?} ({:?}) does {:?}",
+                    binding.keys,
+                    code,
+                    binding.description
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_key_the_app_honours_is_one_the_overlay_advertises() {
+        // The other direction: a key wired up in `handle_key` but left
+        // out of the table would be undiscoverable, which is the whole
+        // problem the overlay exists to solve.
+        let mut candidates: Vec<(KeyCode, KeyModifiers)> = Vec::new();
+        for c in ' '..='~' {
+            candidates.push((KeyCode::Char(c), KeyModifiers::NONE));
+            candidates.push((KeyCode::Char(c), KeyModifiers::CONTROL));
+        }
+        for code in [
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Enter,
+            KeyCode::Esc,
+            KeyCode::Tab,
+            KeyCode::BackTab,
+            KeyCode::Backspace,
+            KeyCode::Delete,
+            KeyCode::Insert,
+        ] {
+            candidates.push((code, KeyModifiers::NONE));
+        }
+
+        for focus in [Focus::Pager, Focus::Outline, Focus::Search] {
+            let state = focus_state(focus);
+            for (code, modifiers) in &candidates {
+                let action = handle_key(&state, KeyEvent::new(*code, *modifiers));
+                match action {
+                    // Not a binding: typing a query is what the `/` row
+                    // already describes, and a lone `g` is half of `gg`.
+                    Action::None | Action::SearchInput(_) => continue,
+                    _ if code == &KeyCode::Char('g') && modifiers.is_empty() => continue,
+                    _ => {}
+                }
+
+                // Matched on key and action, not modifiers: most arms
+                // deliberately ignore modifiers, because a terminal
+                // reports `G` and `N` as SHIFT-modified and they would
+                // otherwise stop working.
+                let advertised = KEYBINDINGS.iter().any(|binding| {
+                    binding
+                        .checks
+                        .iter()
+                        .any(|(c, _, a)| (c, a) == (code, &action))
+                });
+                assert!(
+                    advertised,
+                    "{code:?} with {modifiers:?} does {action:?} in {focus:?}, \
+                     but the help overlay never mentions it"
+                );
+            }
+        }
     }
 }

@@ -161,12 +161,19 @@ pub fn prev_match(current: Option<usize>, total: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    use crate::theme::Palette;
+
     use crate::markdown::blocks::lower;
     use crate::markdown::layout;
 
     fn layout_doc_for(source: &str) -> layout::LayoutDoc {
         let blocks = lower(source);
-        layout::layout(&blocks, 80, &crate::image::Sizing::text_only())
+        layout::layout(
+            &blocks,
+            80,
+            &crate::image::Sizing::text_only(),
+            Palette::Dark,
+        )
     }
 
     #[test]

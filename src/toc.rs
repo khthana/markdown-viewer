@@ -35,6 +35,8 @@ pub fn resolve(headings: &[HeadingRef], layout_doc: &LayoutDoc) -> Vec<TocEntry>
 
 #[cfg(test)]
 mod tests {
+    use crate::theme::Palette;
+
     use super::*;
     use crate::markdown::blocks::lower_with_headings;
     use crate::markdown::layout;
@@ -43,7 +45,12 @@ mod tests {
     fn resolves_headings_to_their_laid_out_rows() {
         let source = "# Title\n\nIntro paragraph text.\n\n## Section";
         let (blocks, headings) = lower_with_headings(source);
-        let layout_doc = layout::layout(&blocks, 80, &crate::image::Sizing::text_only());
+        let layout_doc = layout::layout(
+            &blocks,
+            80,
+            &crate::image::Sizing::text_only(),
+            Palette::Dark,
+        );
 
         let entries = resolve(&headings, &layout_doc);
 

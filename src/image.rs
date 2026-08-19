@@ -288,9 +288,8 @@ pub struct Gallery {
 /// draws nothing at all. Keeping them in one enum means there's no state
 /// where one is present and the other isn't.
 enum Backend {
-    /// Only tests build one today; issue #12's `--no-images` is what
-    /// makes this reachable in production.
-    #[allow(dead_code)]
+    /// `--no-images`, and any terminal the reader has told us not to draw
+    /// into: nothing is decoded and every image stays alt text.
     Disabled,
     Live {
         picker: Picker,
@@ -299,10 +298,10 @@ enum Backend {
 }
 
 impl Gallery {
-    /// A gallery that draws nothing — the alt-text tier. Only tests need
-    /// it until issue #12 adds `--no-images`.
-    #[cfg(test)]
-    pub(crate) fn disabled() -> Self {
+    /// A gallery that draws nothing — the alt-text tier `--no-images`
+    /// and `--no-color` select. It never asks a worker for anything, so
+    /// there's no worker to give it.
+    pub fn disabled() -> Self {
         Self {
             backend: Backend::Disabled,
             generation: 0,
