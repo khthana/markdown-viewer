@@ -1,4 +1,4 @@
-# Handoff: mdview — issues #7–#12 and #15 complete
+# Handoff: mdview — issues #7–#13 and #15 complete
 
 Date: 2026-08-27
 Repo: `C:\Users\Terry\Desktop\Code\markdown-viewer`, branch `master`,
@@ -6,11 +6,13 @@ pushed to `origin` at https://github.com/khthana/markdown-viewer.
 
 ## Where the project stands
 
-Issues 01–12 have shipped, plus #15. The viewer now covers the pager,
+Issues 01–13 have shipped, plus #15. The viewer now covers the pager,
 GFM, syntax highlighting, the TOC sidebar, in-document search,
 auto-reload with anchored scroll restoration, search state across
 reloads, all three image tiers, the full CLI surface, and an `Esc` that
-backs out of one context per press.
+backs out of one context per press. Tagging a version builds and
+attaches binaries for four platforms; crates.io publishing is wired but
+waiting on a token.
 
 Each issue landed as two commits — the implementation, then its ADR:
 
@@ -23,6 +25,7 @@ Each issue landed as two commits — the implementation, then its ADR:
 | #11 graphics protocol tier | `afb1764` | `8444fb9` (ADR-0006) |
 | #12 CLI flags, help, errors | `75da31b` | `848875d` (ADR-0007) |
 | #15 `Esc` cancels a context | `e16dc61` | `1ec4a9b` (ADR-0008) |
+| #13 distribution | `87cba2d` | ADR-0009 |
 
 Test suite: 210 passing, 1 ignored (a filesystem watcher smoke test that
 is run manually), `cargo fmt --check` clean, `cargo clippy --all-targets
@@ -44,11 +47,23 @@ issue/PRD files and are not duplicated here:
 
 ## What is left
 
-- **#13 distribution** (`cargo-dist` release workflow, crates.io, README).
-  No longer blocked: the remote now exists and `ci.yml` runs green on
-  all three OSes, so the release workflow has something to build against.
 - **#14 search anchor survives paragraph reflow.** Filed during #8's
-  review; blocked by nothing.
+  review; blocked by nothing. The last open issue in the v1 set.
+
+## Before the first real release
+
+Two things are deliberately left for a human:
+
+- **`CARGO_REGISTRY_TOKEN` is not set.** Create a token on crates.io and
+  add it as a repository secret. Until then a real (non-prerelease) tag
+  will attach its binaries and then fail the crates.io job on purpose —
+  see ADR-0009 for why failing beats skipping quietly.
+- **Nothing has been published under `mdview-term` yet.** The name is
+  free but unclaimed; the first `cargo publish` claims it.
+
+A release is `git tag -a vX.Y.Z` where `X.Y.Z` matches `Cargo.toml`
+exactly — `dist` resolves the tag against the version and refuses
+anything else.
 
 ## Owed verification
 

@@ -2,7 +2,7 @@
 # `mdview` was taken on crates.io in 2020 by an unrelated tool. The binary
 # is still `mdview`; only the package it ships in carries the suffix.
 name = "mdview-term"
-version = "0.1.0-rc.1"
+version = "0.1.0"
 edition = "2024"
 description = "A terminal Markdown viewer with syntax highlighting, an outline sidebar, live reload and inline images"
 license = "MIT OR Apache-2.0"
