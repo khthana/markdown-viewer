@@ -1,7 +1,8 @@
 # Handoff: mdview — issues #7–#12 and #15 complete
 
 Date: 2026-08-27
-Repo: `C:\Users\Terry\Desktop\Code\markdown-viewer`, branch `master`.
+Repo: `C:\Users\Terry\Desktop\Code\markdown-viewer`, branch `master`,
+pushed to `origin` at https://github.com/khthana/markdown-viewer.
 
 ## Where the project stands
 
@@ -23,9 +24,16 @@ Each issue landed as two commits — the implementation, then its ADR:
 | #12 CLI flags, help, errors | `75da31b` | `848875d` (ADR-0007) |
 | #15 `Esc` cancels a context | `e16dc61` | `1ec4a9b` (ADR-0008) |
 
-Test suite: 209 passing, 1 ignored (a filesystem watcher smoke test that
+Test suite: 210 passing, 1 ignored (a filesystem watcher smoke test that
 is run manually), `cargo fmt --check` clean, `cargo clippy --all-targets
--- -D warnings` clean.
+-- -D warnings` clean. CI (`ci.yml`, push and PR) is green on
+windows-latest, macos-latest and ubuntu-latest as of `7666992`.
+
+The very first CI run went red, on tests that had passed locally for the
+whole project: two watcher tests spelled their paths as Windows literals,
+and off Windows a backslash is an ordinary filename character. Worth
+knowing that this repo's tests were Windows-only by accident until then —
+`cargo test` on one platform is no longer the whole story.
 
 Acceptance criteria, the module map, and testing decisions live in the
 issue/PRD files and are not duplicated here:
@@ -37,11 +45,10 @@ issue/PRD files and are not duplicated here:
 ## What is left
 
 - **#13 distribution** (`cargo-dist` release workflow, crates.io, README).
-  Blocked in practice: this repo has no git remote, and the issue's last
-  acceptance criterion requires a CI run against a GitHub Release.
+  No longer blocked: the remote now exists and `ci.yml` runs green on
+  all three OSes, so the release workflow has something to build against.
 - **#14 search anchor survives paragraph reflow.** Filed during #8's
-  review; blocked by nothing. The only open issue that isn't waiting on
-  a git remote.
+  review; blocked by nothing.
 
 ## Owed verification
 
