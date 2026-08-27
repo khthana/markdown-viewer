@@ -1,14 +1,15 @@
-# Handoff: mdview — issues #7–#12 complete
+# Handoff: mdview — issues #7–#12 and #15 complete
 
-Date: 2026-08-19
+Date: 2026-08-27
 Repo: `C:\Users\Terry\Desktop\Code\markdown-viewer`, branch `master`.
 
 ## Where the project stands
 
-Issues 01–12 have shipped. The viewer now covers the pager, GFM, syntax
-highlighting, the TOC sidebar, in-document search, auto-reload with
-anchored scroll restoration, search state across reloads, all three image
-tiers, and the full CLI surface.
+Issues 01–12 have shipped, plus #15. The viewer now covers the pager,
+GFM, syntax highlighting, the TOC sidebar, in-document search,
+auto-reload with anchored scroll restoration, search state across
+reloads, all three image tiers, the full CLI surface, and an `Esc` that
+backs out of one context per press.
 
 Each issue landed as two commits — the implementation, then its ADR:
 
@@ -20,8 +21,9 @@ Each issue landed as two commits — the implementation, then its ADR:
 | #10 half-block tier | `e2b9031` | `d0d0040` (ADR-0005) |
 | #11 graphics protocol tier | `afb1764` | `8444fb9` (ADR-0006) |
 | #12 CLI flags, help, errors | `75da31b` | `848875d` (ADR-0007) |
+| #15 `Esc` cancels a context | `e16dc61` | `1ec4a9b` (ADR-0008) |
 
-Test suite: 201 passing, 1 ignored (a filesystem watcher smoke test that
+Test suite: 209 passing, 1 ignored (a filesystem watcher smoke test that
 is run manually), `cargo fmt --check` clean, `cargo clippy --all-targets
 -- -D warnings` clean.
 
@@ -38,10 +40,8 @@ issue/PRD files and are not duplicated here:
   Blocked in practice: this repo has no git remote, and the issue's last
   acceptance criterion requires a CI run against a GitHub Release.
 - **#14 search anchor survives paragraph reflow.** Filed during #8's
-  review; blocked by nothing.
-- **#15 `Esc` cancels the current context in normal mode.** Filed during
-  #12's review; the PRD advertises the key but nothing honours it outside
-  search input.
+  review; blocked by nothing. The only open issue that isn't waiting on
+  a git remote.
 
 ## Owed verification
 
@@ -96,8 +96,11 @@ bug caught by review rather than a hypothetical:
 - **Anything that isn't drawable right now shows a placeholder**, images
   pending an *encode* included — that gap made every picture flash a hole
   for one frame after decoding and after every resize.
+- **A key that cancels must never move the reader.** Every `Esc`
+  precedence case asserts `scroll` is untouched, because the one thing an
+  accidental press must not cost is the reader's place.
 
 ## Suggested next step
 
-No decision has been made on what comes next. #14 and #15 are both
-unblocked and small; #13 needs a git remote to exist first.
+No decision has been made on what comes next. #14 is the only unblocked
+issue left; #13 needs a git remote to exist first.
