@@ -379,6 +379,7 @@ fn render_toc(frame: &mut Frame, area: Rect, toc: &[TocEntry], selected: usize, 
 mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::style::{Color, Modifier};
 
     use super::*;
@@ -866,6 +867,66 @@ mod tests {
                     .map(|x| buffer.cell((x, y)).unwrap().symbol().to_string())
                     .collect::<String>()
             })
+            .collect()
+    }
+
+    #[test]
+    fn esc_puts_the_screen_back_the_way_it_was_before_the_search() {
+        // The status row and the highlights are the whole visible cost of
+        // a search, so "the search is cleared" is really the claim that
+        // the screen is indistinguishable from one that never searched.
+        let blocks = crate::markdown::blocks::lower("the quick brown fox");
+        let matches = search::search(
+            "fox",
+            &layout::layout(
+                &blocks,
+                40,
+                &crate::image::Sizing::text_only(),
+                Palette::Dark,
+            ),
+        );
+
+        let untouched = App::new(0);
+        let before = cells(&untouched, &blocks, &[]);
+
+        let mut app = App::new(0);
+        app.search_query = "fox".to_string();
+        app.search_active = true;
+        app.current_match = Some(0);
+        assert_ne!(
+            cells(&app, &blocks, &matches),
+            before,
+            "the search has to change the screen, or this test proves nothing"
+        );
+
+        app.on_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &[],
+            &matches,
+        );
+
+        // The post-Esc state is reached by pressing the key rather than
+        // assigned field by field: assigning it would bake this test's
+        // own idea of "cleared" into the assertion, which is the very
+        // thing it exists to catch.
+        //
+        // Empty query, so the next frame's matches recompute to none,
+        // exactly as the main loop re-runs the search each draw.
+        assert_eq!(cells(&app, &blocks, &[]), before);
+    }
+
+    /// Every cell of a rendered frame, symbol and style alike.
+    fn cells(app: &App, blocks: &[Block], matches: &[search::Match]) -> Vec<(String, Style)> {
+        let mut terminal = Terminal::new(TestBackend::new(40, 4)).unwrap();
+        terminal
+            .draw(|frame| text_render(frame, app, blocks, &[], matches))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| (cell.symbol().to_string(), cell.style()))
             .collect()
     }
 

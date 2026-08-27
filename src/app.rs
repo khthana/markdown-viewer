@@ -53,6 +53,9 @@ pub enum Action {
     Reload,
     OpenHelp,
     CloseHelp,
+    /// The reader pressed `Esc` in normal mode. Which context that backs
+    /// out of depends on what is open, which only `App` knows.
+    Cancel,
 }
 
 impl Action {
@@ -185,6 +188,12 @@ pub const KEYBINDINGS: &[Binding] = &[
         checks: &[(KeyCode::Enter, KeyModifiers::NONE, Action::TocJump)],
     },
     Binding {
+        keys: "Esc",
+        description: "Close the outline",
+        focus: Focus::Outline,
+        checks: &[(KeyCode::Esc, KeyModifiers::NONE, Action::Cancel)],
+    },
+    Binding {
         keys: "/",
         description: "Search the document",
         focus: Focus::Pager,
@@ -211,6 +220,12 @@ pub const KEYBINDINGS: &[Binding] = &[
         description: "Abandon the search",
         focus: Focus::Search,
         checks: &[(KeyCode::Esc, KeyModifiers::NONE, Action::ExitSearch)],
+    },
+    Binding {
+        keys: "Esc",
+        description: "Clear the search, or close the outline",
+        focus: Focus::Pager,
+        checks: &[(KeyCode::Esc, KeyModifiers::NONE, Action::Cancel)],
     },
     Binding {
         keys: "n / N",
@@ -280,6 +295,7 @@ pub fn handle_key(state: &AppState, key: KeyEvent) -> Action {
         KeyCode::Char('q') => return Action::Quit,
         KeyCode::Char('r') => return Action::Reload,
         KeyCode::Char('?') => return Action::OpenHelp,
+        KeyCode::Esc => return Action::Cancel,
         _ => {}
     }
 
@@ -406,6 +422,24 @@ impl App {
         max_scroll(self.total_rows, self.viewport_height)
     }
 
+    /// Drops the query, its highlights and its selection, which releases
+    /// the status row back to the document. Shared by `Esc` while a query
+    /// is being typed and `Esc` once one has been confirmed, so the two
+    /// ways out of a search can't leave different state behind.
+    ///
+    /// It clears `search_fell_back` on a different rule from
+    /// `is_search_step`'s: that one says a deliberate step supersedes the
+    /// note, this one that the note can't outlive the search it describes.
+    /// `Cancel` is deliberately not a search step, so closing the outline
+    /// over a fallback-flagged search leaves the note standing.
+    fn clear_search(&mut self) {
+        self.mode = Mode::Normal;
+        self.search_query.clear();
+        self.search_active = false;
+        self.current_match = None;
+        self.search_fell_back = false;
+    }
+
     /// Handles a keypress: decides the action, applies it, and updates the
     /// `gg`-sequence flag. `toc` is the currently resolved TOC entries (for
     /// selection bounds and jump targets); `matches` is the current
@@ -486,12 +520,7 @@ impl App {
                     self.scroll = first.row.min(self.max_scroll());
                 }
             }
-            Action::ExitSearch => {
-                self.mode = Mode::Normal;
-                self.search_query.clear();
-                self.search_active = false;
-                self.current_match = None;
-            }
+            Action::ExitSearch => self.clear_search(),
             Action::NextMatch => {
                 if !matches.is_empty() {
                     self.current_match = search::next_match(self.current_match, matches.len());
@@ -506,6 +535,21 @@ impl App {
                     if let Some(idx) = self.current_match {
                         self.scroll = matches[idx].row.min(self.max_scroll());
                     }
+                }
+            }
+            // One context per press, innermost first: whatever holds
+            // the keyboard goes before what merely marks up the
+            // document, and an outline left open by a jump goes last.
+            // With nothing open this is deliberately inert — an
+            // accidental Esc must never cost the reader their place.
+            Action::Cancel => {
+                if self.toc_focused {
+                    self.toc_open = false;
+                    self.toc_focused = false;
+                } else if self.search_active {
+                    self.clear_search();
+                } else if self.toc_open {
+                    self.toc_open = false;
                 }
             }
             Action::None => {}
@@ -1118,6 +1162,134 @@ mod tests {
 
         assert!(!app.help_open);
         assert_eq!(app.search_query, "?");
+    }
+
+    #[test]
+    fn esc_in_normal_mode_asks_to_cancel_the_current_context() {
+        // The key map only knows the reader pressed the cancel key;
+        // which context that cancels is `App::on_key`'s decision, since
+        // it is the only thing that knows what is currently open.
+        assert_eq!(
+            handle_key(&focus_state(Focus::Pager), key(KeyCode::Esc)),
+            Action::Cancel
+        );
+        assert_eq!(
+            handle_key(&focus_state(Focus::Outline), key(KeyCode::Esc)),
+            Action::Cancel
+        );
+    }
+
+    /// A reader partway down a document with a search confirmed. The
+    /// precedence cases build on this, opening the outline themselves
+    /// when that is what they are about.
+    fn reader_mid_search() -> App {
+        let mut app = App::new(100);
+        app.viewport_height = 10;
+        app.scroll = 40;
+        app.search_query = "fox".to_string();
+        app.search_active = true;
+        app.current_match = Some(1);
+        app
+    }
+
+    #[test]
+    fn esc_with_a_confirmed_search_clears_it_without_moving_the_reader() {
+        let mut app = reader_mid_search();
+        app.search_fell_back = true;
+
+        let outcome = app.on_key(key(KeyCode::Esc), &[], &[a_match(0, 0, 3)]);
+
+        assert_eq!(outcome, KeyOutcome::Continue);
+        assert_eq!(app.search_query, "");
+        assert!(!app.search_active);
+        assert_eq!(app.current_match, None);
+        assert!(!app.search_fell_back);
+        assert_eq!(app.scroll, 40, "clearing highlights must not scroll");
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn esc_closes_the_focused_outline_before_touching_the_search() {
+        // Esc dismisses whatever has the keyboard first; the highlights
+        // are still there for a second press.
+        let mut app = reader_mid_search();
+        app.toc_open = true;
+        app.toc_focused = true;
+
+        app.on_key(key(KeyCode::Esc), &[], &[a_match(0, 0, 3)]);
+
+        assert!(!app.toc_open);
+        assert!(!app.toc_focused);
+        assert!(app.search_active, "the search survives the first Esc");
+        assert_eq!(app.search_query, "fox");
+        assert_eq!(app.scroll, 40);
+    }
+
+    #[test]
+    fn esc_closes_an_unfocused_outline_once_the_search_is_clear() {
+        // Jumping from the outline leaves it open but unfocused. The
+        // search is the inner context, so it goes first.
+        let mut app = reader_mid_search();
+        app.toc_open = true;
+
+        app.on_key(key(KeyCode::Esc), &[], &[a_match(0, 0, 3)]);
+
+        assert!(!app.search_active);
+        assert!(app.toc_open, "the outline outlives the search");
+
+        app.on_key(key(KeyCode::Esc), &[], &[]);
+
+        assert!(!app.toc_open);
+        assert_eq!(app.scroll, 40);
+    }
+
+    #[test]
+    fn esc_abandons_a_query_even_while_the_outline_is_focused() {
+        // A query being typed holds the keyboard ahead of everything
+        // else, the outline included, so it is the innermost context of
+        // all — `focus_state` can't express this pairing, hence the
+        // hand-built state.
+        let state = AppState {
+            pending_g: false,
+            toc_focused: true,
+            mode: Mode::Search,
+            help_open: false,
+        };
+
+        assert_eq!(handle_key(&state, key(KeyCode::Esc)), Action::ExitSearch);
+    }
+
+    #[test]
+    fn esc_closes_the_outline_when_no_search_was_ever_run() {
+        // The plainest path there is: Tab, then Esc. The outline branch
+        // must not quietly depend on a search being active.
+        let toc = [toc_entry("Heading", 0)];
+        let mut app = App::new(100);
+        app.viewport_height = 10;
+        app.on_key(key(KeyCode::Tab), &toc, &[]);
+        assert!(app.toc_open && app.toc_focused, "Tab opens and focuses");
+
+        app.on_key(key(KeyCode::Esc), &toc, &[]);
+
+        assert!(!app.toc_open);
+        assert!(!app.toc_focused);
+    }
+
+    #[test]
+    fn esc_with_nothing_active_does_nothing_at_all() {
+        // Notably it does not quit: an accidental Esc must never cost the
+        // reader their place in the document.
+        let mut app = App::new(100);
+        app.viewport_height = 10;
+        app.scroll = 40;
+
+        let outcome = app.on_key(key(KeyCode::Esc), &[], &[]);
+
+        assert_eq!(outcome, KeyOutcome::Continue);
+        assert_eq!(app.scroll, 40);
+        assert!(!app.toc_open);
+        assert!(!app.search_active);
+        assert_eq!(app.mode, Mode::Normal);
     }
 
     /// The state a binding's focus describes.
