@@ -24,10 +24,12 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    # Reading the tag is all this needs; the caller's write scopes and
-    # dist's escalated id-token/packages permissions are not wanted here.
-    permissions:
-      contents: read
+    # No `permissions:` block here on purpose, tempting as it is: a called
+    # workflow can only ever narrow *within* what the caller granted, and
+    # dist's generated caller lists id-token and packages and nothing
+    # else — so every other scope is already `none`. Asking for
+    # `contents: read` on top of that is asking for more than the caller
+    # has, and the whole run fails before a single job starts.
     steps:
       - uses: actions/checkout@v6
         with:
