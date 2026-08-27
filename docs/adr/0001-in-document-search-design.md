@@ -49,9 +49,10 @@ model, and how highlighting composes with already-styled text.
 - **`Esc` was scoped to only clear/exit search** for this issue. The
   PRD's keybinding table groups `Esc` as also closing the TOC sidebar,
   but issue #6's acceptance criteria only covers search — unifying that
-  behavior was deferred rather than bundled in here. (Issue #15 re-opens
-  this: `Esc` in normal mode still does nothing at all, which issue #12's
-  `?` overlay made visible by documenting the keymap as it stands.)
+  behavior was deferred rather than bundled in here. (Issue #15 closed
+  this deferral: `Esc` now backs out of one context per press, decided in
+  ADR-0008. Issue #12's `?` overlay is what made the gap visible, by
+  documenting the keymap as it stood.)
 
 ## Consequences
 
@@ -62,4 +63,5 @@ model, and how highlighting composes with already-styled text.
   search reads `LayoutDoc.rows` rather than walking `Block` again.
 - If a later issue unifies `Esc` to also close the TOC, that change is
   additive in `app::handle_key`'s Normal-mode branch, not a rework of the
-  search state machine.
+  search state machine. (Borne out: ADR-0008 added one arm to that branch
+  and one `match` arm in `App::on_key`, and touched nothing in `search.rs`.)

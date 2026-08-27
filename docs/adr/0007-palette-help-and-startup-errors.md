@@ -90,7 +90,8 @@ the reader saw a pager flash and then an `os error 2` chain.
 - The dump path renders at a fixed 80 columns and always uses the
   alt-text tier. It is not a formatter — no `--width`, no reflow to the
   pipe's consumer.
-- `Esc` still does nothing in normal mode, though the PRD lists it as
-  "exit search / close TOC / clear highlight". The overlay therefore
-  documents a keymap that is itself incomplete; closing that gap is its
-  own change.
+- `Esc` did nothing in normal mode when this was written, though the PRD
+  lists it as "exit search / close TOC / clear highlight" — so the
+  overlay documented a keymap that was itself incomplete. Issue #15
+  closed that gap, and ADR-0008 records how: the both-directions tests
+  are what forced the new rows into the table.
