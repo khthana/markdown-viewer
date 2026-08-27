@@ -75,10 +75,21 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// A path spelled with this platform's own separator, which is what
+    /// the watcher hands us. Written as components rather than a literal
+    /// so the same test means the same thing on all three targets: a
+    /// backslash is a separator on Windows and an ordinary filename
+    /// character everywhere else, which is enough to make a literal
+    /// Windows path pass a negative assertion on Linux for the wrong
+    /// reason.
+    fn event_path(components: &[&str]) -> PathBuf {
+        components.iter().collect()
+    }
+
     #[test]
     fn matches_an_event_for_the_watched_file() {
         assert!(event_matches_target(
-            &PathBuf::from(r"C:\notes\readme.md"),
+            &event_path(&["notes", "readme.md"]),
             OsStr::new("readme.md")
         ));
     }
@@ -89,11 +100,11 @@ mod tests {
         // files (including editors' atomic-save temp files) show up here
         // and must not trigger a reload.
         assert!(!event_matches_target(
-            &PathBuf::from(r"C:\notes\other.md"),
+            &event_path(&["notes", "other.md"]),
             OsStr::new("readme.md")
         ));
         assert!(!event_matches_target(
-            &PathBuf::from(r"C:\notes\readme.md~RF1a2b3.TMP"),
+            &event_path(&["notes", "readme.md~RF1a2b3.TMP"]),
             OsStr::new("readme.md")
         ));
     }
@@ -107,7 +118,22 @@ mod tests {
             OsStr::new("readme.md")
         ));
         assert!(event_matches_target(
-            &PathBuf::from(r".\sub\readme.md"),
+            &event_path(&[".", "sub", "readme.md"]),
+            OsStr::new("readme.md")
+        ));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn matches_a_drive_letter_path_on_windows() {
+        // The spelling Windows actually delivers, kept as a literal
+        // because that is the point of this one.
+        assert!(event_matches_target(
+            &PathBuf::from(r"C:\notes\readme.md"),
+            OsStr::new("readme.md")
+        ));
+        assert!(!event_matches_target(
+            &PathBuf::from(r"C:\notes\other.md"),
             OsStr::new("readme.md")
         ));
     }
