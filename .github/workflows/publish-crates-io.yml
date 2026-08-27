@@ -1,0 +1,52 @@
+# Publishing to crates.io is deliberately a job of its own rather than a
+# step inside the release: the two distribution channels fail, and are
+# re-run, independently. `dist` calls this as a custom publish job once a
+# tagged release has built and been hosted; it can also be run by hand
+# against any tag from the Actions tab.
+name: Publish to crates.io
+
+on:
+  workflow_call:
+    inputs:
+      # Required by dist's custom-publish contract and deliberately
+      # unused: this job publishes the crate, which is the same source
+      # the tag names, whatever the release plan happens to say.
+      plan:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish, e.g. v0.1.0"
+        required: true
+        type: string
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # Reading the tag is all this needs; the caller's write scopes and
+    # dist's escalated id-token/packages permissions are not wanted here.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Called from the release: whatever tag triggered it. Run by
+          # hand: the tag that was asked for, never a moving branch.
+          ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          # dist skips this job entirely for prereleases, so reaching here
+          # with no token means a real release would go green having
+          # published nothing. Fail loudly instead: the binaries are
+          # already attached by then, and this job can be re-run on its
+          # own from the Actions tab once the secret exists.
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "::error::CARGO_REGISTRY_TOKEN is not set, so this release reached GitHub but not crates.io. Add the secret, then re-run this workflow against the same tag."
+            exit 1
+          fi
+          cargo publish --locked

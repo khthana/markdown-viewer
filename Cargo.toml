@@ -1,7 +1,22 @@
 [package]
-name = "mdview"
+# `mdview` was taken on crates.io in 2020 by an unrelated tool. The binary
+# is still `mdview`; only the package it ships in carries the suffix.
+name = "mdview-term"
 version = "0.1.0"
 edition = "2024"
+description = "A terminal Markdown viewer with syntax highlighting, an outline sidebar, live reload and inline images"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/khthana/markdown-viewer"
+readme = "README.md"
+keywords = ["markdown", "terminal", "tui", "viewer", "cli"]
+categories = ["command-line-utilities", "text-processing"]
+# The issue tracker and PRD are part of the repo, not of the published
+# crate; they are public on GitHub either way.
+exclude = [".scratch/"]
+
+[[bin]]
+name = "mdview"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.103"
@@ -12,3 +27,10 @@ pulldown-cmark = "0.13.4"
 ratatui = "0.30.1"
 ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm", "image-defaults"] }
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
+
+# Written by `dist init`: what released binaries are built with. Thin LTO
+# is the trade it picks — a smaller, faster download than a plain release
+# build, without full LTO's link time on every CI target.
+[profile.dist]
+inherits = "release"
+lto = "thin"
