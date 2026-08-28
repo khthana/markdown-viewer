@@ -614,6 +614,23 @@ Body.");
     }
 
     #[test]
+    fn reloading_after_an_edit_inside_the_matchs_own_paragraph_keeps_it_selected() {
+        // The writer's live-edit case: a word added at the front of the
+        // paragraph the match sits in, which rewraps every row of it.
+        let paragraph = "the quick brown fox jumps over the lazy dog while the \
+whole village watches from the riverbank and says nothing at all";
+        let mut session = SearchSession::open("reload-search-rewrap", paragraph, "fox", Some(0));
+
+        session.save_and_reload(&format!("Yesterday {paragraph}"));
+
+        assert_eq!(session.app.current_match, Some(0));
+        assert!(
+            !session.app.search_fell_back,
+            "rewrapping the paragraph is not losing the match"
+        );
+    }
+
+    #[test]
     fn reloading_after_the_selected_match_is_deleted_falls_back_to_the_first() {
         let mut session =
             SearchSession::open("reload-search-lost", "fox one\n\nfox two", "fox", Some(1));

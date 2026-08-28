@@ -42,15 +42,23 @@ pub fn search(query: &str, layout_doc: &LayoutDoc) -> Vec<Match> {
     matches
 }
 
-/// Identifies one search match by what the reader sees — the text of the
-/// row it sits in, its column, and which of the identical (row, column)
-/// pairs it is — rather than by its index in the match list, so it
-/// survives matches appearing or disappearing elsewhere in the document.
+/// Identifies one search match, first by what the reader sees — the text
+/// of the row it sits in, its column, and which of the identical (row,
+/// column) pairs it is — rather than by its index in the match list, so
+/// it survives matches appearing or disappearing elsewhere in the
+/// document.
+///
+/// `index` and `total` are the fallback for when the row itself was
+/// re-wrapped: see [`resolve_match`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatchAnchor {
     row_text: String,
     start: usize,
     occurrence: usize,
+    /// Which match this was, counting the whole document in order.
+    index: usize,
+    /// How many matches there were in total when this was captured.
+    total: usize,
 }
 
 impl MatchAnchor {
@@ -63,6 +71,28 @@ impl MatchAnchor {
                 .rows
                 .get(candidate.row)
                 .is_some_and(|text| text == &self.row_text)
+    }
+
+    /// Whether the document still holds as many matches as when this
+    /// anchor was taken — the one cheap signal that separates "the same
+    /// matches, laid out differently" from "the matches themselves
+    /// changed", and so the only condition under which the anchored
+    /// position still means anything.
+    ///
+    /// It is a population check, not an identity check: a save that
+    /// removes one occurrence and adds another leaves the count alone,
+    /// and the position then names a different occurrence. Catching that
+    /// would need an identity for the containing block, which nothing in
+    /// a re-parsed document reliably provides.
+    ///
+    /// The position itself is the rule the app already lives by when the
+    /// terminal is resized: matches are recomputed every frame and
+    /// `current_match` keeps its place through the reflow.
+    fn match_population_unchanged(&self, total_now: usize) -> bool {
+        // `index < total` by construction — `anchor_match` only builds an
+        // anchor for a match it found — so an equal count is the whole
+        // test, and `index` is in range for the new list too.
+        total_now == self.total
     }
 }
 
@@ -98,6 +128,8 @@ pub fn anchor_match(
         row_text,
         start: selected.start,
         occurrence: 0,
+        index,
+        total: matches.len(),
     };
     let occurrence = matches[..index]
         .iter()
@@ -112,6 +144,12 @@ pub fn anchor_match(
 /// Finds the anchored match in a freshly laid-out document. `anchor` is
 /// `None` when nothing was selected before the reload, in which case the
 /// query is simply re-run.
+///
+/// Two tiers, in order. The row text finds the match wherever it has
+/// moved to, which is what survives edits elsewhere in the document. When
+/// the match's own row was re-wrapped — an edit earlier in the same
+/// paragraph, or a narrower terminal — there is no such row to find, and
+/// the position in the match list is all that is left to go on.
 pub fn resolve_match(
     anchor: Option<&MatchAnchor>,
     query: &str,
@@ -129,10 +167,13 @@ pub fn resolve_match(
         .iter()
         .enumerate()
         .filter(|(_, candidate)| anchor.matches(candidate, layout_doc));
-    match candidates.map(|(index, _)| index).nth(anchor.occurrence) {
-        Some(index) => Reselection::Preserved(index),
-        None => Reselection::FellBackToFirst,
+    if let Some(index) = candidates.map(|(index, _)| index).nth(anchor.occurrence) {
+        return Reselection::Preserved(index);
     }
+    if anchor.match_population_unchanged(matches.len()) {
+        return Reselection::Preserved(anchor.index);
+    }
+    Reselection::FellBackToFirst
 }
 
 /// The match index to select after `n`, wrapping from the last match back
@@ -167,10 +208,16 @@ mod tests {
     use crate::markdown::layout;
 
     fn layout_doc_for(source: &str) -> layout::LayoutDoc {
+        layout_doc_at(source, 80)
+    }
+
+    /// `width` is what lets a test reflow the same source the way a
+    /// resized terminal would.
+    fn layout_doc_at(source: &str, width: usize) -> layout::LayoutDoc {
         let blocks = lower(source);
         layout::layout(
             &blocks,
-            80,
+            width,
             &crate::image::Sizing::text_only(),
             Palette::Dark,
         )
@@ -353,6 +400,126 @@ mod tests {
             super::Reselection::Preserved(1)
         );
         assert_eq!(super::search("fox", &new)[1].row, 2);
+    }
+
+    /// A paragraph long enough that 80 columns wrap it onto two rows, so
+    /// an edit anywhere in its first row rewrites the row the match sits
+    /// in.
+    const LONG: &str = "the quick brown fox jumps over the lazy dog while the \
+whole village watches from the riverbank and says nothing at all about it";
+
+    #[test]
+    fn keeps_the_selection_when_the_matchs_own_paragraph_is_rewrapped() {
+        // The word added at the front pushes every later word along, so
+        // the row the match sits in reads differently even though the
+        // match itself is untouched.
+        let old = layout_doc_for(LONG);
+        let anchor = super::anchor_match("fox", &old, Some(0)).expect("a match is selected");
+
+        let new = layout_doc_for(&format!("Yesterday {LONG}"));
+
+        assert_eq!(
+            super::resolve_match(Some(&anchor), "fox", &new),
+            super::Reselection::Preserved(0)
+        );
+    }
+
+    #[test]
+    fn tells_two_matches_in_one_rewrapped_paragraph_apart() {
+        let source = format!("{LONG} and then another fox appeared");
+        let old = layout_doc_for(&source);
+        let anchor = super::anchor_match("fox", &old, Some(1)).expect("the second fox");
+
+        let new = layout_doc_for(&format!("Yesterday {source}"));
+
+        assert_eq!(
+            super::resolve_match(Some(&anchor), "fox", &new),
+            super::Reselection::Preserved(1),
+            "the second fox stays selected, not the first"
+        );
+    }
+
+    #[test]
+    fn keeps_the_selection_when_an_edit_after_the_match_moves_the_wrap_boundary() {
+        // Nothing is inserted ahead of the match this time: the match
+        // keeps its row and column, and it is the tail of its own row
+        // that changes. Tier one still can't find it.
+        let old = layout_doc_for(LONG);
+        let anchor = super::anchor_match("fox", &old, Some(0)).expect("a match is selected");
+
+        let new = layout_doc_for(&LONG.replace("lazy dog", "extremely lazy dog"));
+
+        assert_eq!(
+            super::resolve_match(Some(&anchor), "fox", &new),
+            super::Reselection::Preserved(0)
+        );
+    }
+
+    #[test]
+    fn swapping_one_match_for_another_keeps_the_position_not_the_text() {
+        // The known limit of a population check, pinned so it stays a
+        // decision rather than a surprise: this save deletes the selected
+        // "fox" and adds a different one, which leaves the count alone,
+        // so the position resolves — to an occurrence the reader never
+        // selected, and without the note that says so.
+        let old = layout_doc_for(&format!("{LONG} and then another fox appeared"));
+        let anchor = super::anchor_match("fox", &old, Some(1)).expect("the second fox");
+
+        let new = layout_doc_for(&format!(
+            "Yesterday {LONG} and then nothing appeared, though a fox arrived later"
+        ));
+
+        assert_eq!(
+            super::resolve_match(Some(&anchor), "fox", &new),
+            super::Reselection::Preserved(1)
+        );
+    }
+
+    #[test]
+    fn a_deleted_match_still_falls_back_even_when_the_rest_rewrapped() {
+        let source = format!("{LONG} and then another fox appeared");
+        let old = layout_doc_for(&source);
+        let anchor = super::anchor_match("fox", &old, Some(1)).expect("the second fox");
+
+        // The second fox is gone, so the population changed and the
+        // ordinal can't be trusted.
+        let new = layout_doc_for(&format!("Yesterday {LONG} and then nothing appeared"));
+
+        assert_eq!(
+            super::resolve_match(Some(&anchor), "fox", &new),
+            super::Reselection::FellBackToFirst
+        );
+    }
+
+    #[test]
+    fn keeps_the_selection_when_only_the_terminal_width_changed() {
+        // No edit at all: the same document laid out narrower, which is
+        // what a resize does to every row's text at once.
+        let old = layout_doc_at(LONG, 80);
+        let anchor = super::anchor_match("fox", &old, Some(0)).expect("a match is selected");
+
+        let new = layout_doc_at(LONG, 30);
+
+        assert_eq!(
+            super::resolve_match(Some(&anchor), "fox", &new),
+            super::Reselection::Preserved(0)
+        );
+    }
+
+    #[test]
+    fn a_new_match_inside_the_rewrapped_paragraph_gives_up_the_selection() {
+        // Deliberately conservative: the ordinal only means anything
+        // while the match population is unchanged, and a new occurrence
+        // ahead of the selected one would silently shift it.
+        let old = layout_doc_for(LONG);
+        let anchor = super::anchor_match("fox", &old, Some(0)).expect("a match is selected");
+
+        let new = layout_doc_for(&format!("A fox once. {LONG}"));
+
+        assert_eq!(
+            super::resolve_match(Some(&anchor), "fox", &new),
+            super::Reselection::FellBackToFirst
+        );
     }
 
     #[test]
