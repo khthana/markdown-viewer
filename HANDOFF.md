@@ -1,4 +1,4 @@
-# Handoff: mdview — issues #7–#13 and #15 complete
+# Handoff: mdview — the v1 issue set is complete
 
 Date: 2026-08-27
 Repo: `C:\Users\Terry\Desktop\Code\markdown-viewer`, branch `master`,
@@ -6,7 +6,7 @@ pushed to `origin` at https://github.com/khthana/markdown-viewer.
 
 ## Where the project stands
 
-Issues 01–13 have shipped, plus #15. The viewer now covers the pager,
+Every issue in `.scratch/mdview-v1/` has shipped: 01–15. The viewer now covers the pager,
 GFM, syntax highlighting, the TOC sidebar, in-document search,
 auto-reload with anchored scroll restoration, search state across
 reloads, all three image tiers, the full CLI surface, and an `Esc` that
@@ -25,9 +25,10 @@ Each issue landed as two commits — the implementation, then its ADR:
 | #11 graphics protocol tier | `afb1764` | `8444fb9` (ADR-0006) |
 | #12 CLI flags, help, errors | `75da31b` | `848875d` (ADR-0007) |
 | #15 `Esc` cancels a context | `e16dc61` | `1ec4a9b` (ADR-0008) |
-| #13 distribution | `87cba2d` | ADR-0009 |
+| #13 distribution | `87cba2d` | `f881b52` (ADR-0009) |
+| #14 anchor survives a rewrap | `8e9f6bd` | ADR-0010 |
 
-Test suite: 210 passing, 1 ignored (a filesystem watcher smoke test that
+Test suite: 218 passing, 1 ignored (a filesystem watcher smoke test that
 is run manually), `cargo fmt --check` clean, `cargo clippy --all-targets
 -- -D warnings` clean. CI (`ci.yml`, push and PR) is green on
 windows-latest, macos-latest and ubuntu-latest as of `7666992`.
@@ -47,8 +48,8 @@ issue/PRD files and are not duplicated here:
 
 ## What is left
 
-- **#14 search anchor survives paragraph reflow.** Filed during #8's
-  review; blocked by nothing. The last open issue in the v1 set.
+Nothing in the v1 issue set. What remains is release work (below) and
+the manual checklist #11 still owes.
 
 ## Before the first real release
 
@@ -118,11 +119,16 @@ bug caught by review rather than a hypothetical:
 - **Anything that isn't drawable right now shows a placeholder**, images
   pending an *encode* included — that gap made every picture flash a hole
   for one frame after decoding and after every resize.
+- **A reload must not be worse than a resize.** Both re-wrap every row;
+  a resize keeps the selected search match by its position in the match
+  list, so ADR-0010 makes a reload fall back to the same rule rather than
+  to a lost selection.
 - **A key that cancels must never move the reader.** Every `Esc`
   precedence case asserts `scroll` is untouched, because the one thing an
   accidental press must not cost is the reader's place.
 
 ## Suggested next step
 
-No decision has been made on what comes next. #14 is the only unblocked
-issue left; #13 needs a git remote to exist first.
+The v1 set is done. The next real step is a release: set
+`CARGO_REGISTRY_TOKEN`, then tag `v0.1.0`. Issue #11's manual checklist
+is the one piece of verification still owed.

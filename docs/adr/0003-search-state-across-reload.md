@@ -52,15 +52,19 @@ point at a different occurrence, or at nothing.
   reload, and a selection is what `n`/`N` navigate from. The whole step is
   gated on `search_active`, so a viewer with no search runs untouched.
 
-## Known limitation
+## Known limitation — closed by ADR-0010
 
 Because a match is identified by its whole rendered row, an edit *inside
 the same wrapped paragraph* (a typo fix, a word added earlier in the
-paragraph) rewrites that row's text and drops the anchor, even though the
-matched text itself survives — the reader lands on match 1 with the
-"previous match gone" note. Resolving that needs a coarser identity (the
-match's ordinal within its section or block) and is deliberately left out
-of this issue.
+paragraph) rewrote that row's text and dropped the anchor, even though the
+matched text itself survived — the reader landed on match 1 with the
+"previous match gone" note. Resolving it was deliberately left out of this
+issue and left to issue #14.
+
+ADR-0010 closed it, though not with the section- or block-scoped ordinal
+guessed at here: the row text is now the first of two tiers, and when it
+finds nothing the match's position in the document-wide list is used
+instead, trusted only while the total match count is unchanged.
 
 ## Consequences
 
@@ -70,3 +74,5 @@ of this issue.
 - A rewritten line loses its anchor even if the query still matches
   inside it — the selection falls back to the first match and says so,
   which is the issue's specified behavior for an unresolvable match.
+  (Since ADR-0010 this holds only when the document's match count changed
+  as well; a pure re-wrap keeps the selection by position.)
